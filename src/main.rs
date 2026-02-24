@@ -700,6 +700,55 @@ fn check_ffmpeg() -> Result<()> {
     Ok(())
 }
 
+/// Build video encoder arguments for FFmpeg
+fn build_encode_args(crf: u8, preset: &str, config: &EncoderConfig) -> Vec<String> {
+    match config.encoder_type {
+        EncoderType::Cpu => vec![
+            "-c:v".to_string(),
+            "libx265".to_string(),
+            "-crf".to_string(),
+            crf.to_string(),
+            "-preset".to_string(),
+            preset.to_string(),
+            "-x265-params".to_string(),
+            "fast=1:log-level=error".to_string(),
+        ],
+        EncoderType::Gpu => vec![
+            "-c:v".to_string(),
+            "hevc_nvenc".to_string(),
+            "-preset".to_string(),
+            "p7".to_string(),
+            "-tune".to_string(),
+            "hq".to_string(),
+            "-rc".to_string(),
+            "vbr".to_string(),
+            "-rc-lookahead".to_string(),
+            "32".to_string(),
+            "-b_ref_mode".to_string(),
+            "middle".to_string(),
+            "-qmin".to_string(),
+            "24".to_string(),
+            "-qmax".to_string(),
+            "28".to_string(),
+            "-init_qpP".to_string(),
+            "24".to_string(),
+            "-init_qpB".to_string(),
+            "26".to_string(),
+            "-init_qpI".to_string(),
+            "24".to_string(),
+            "-no-scenecut".to_string(),
+            "0".to_string(),
+            "-spatial_aq".to_string(),
+            "1".to_string(),
+            "-temporal_aq".to_string(),
+            "1".to_string(),
+            "-aq-strength".to_string(),
+            "8".to_string(),
+        ],
+        EncoderType::Auto => unreachable!("Auto should be resolved before calling build_encode_args"),
+    }
+}
+
 fn scan_videos(dir: &Path) -> Result<Vec<PathBuf>> {
     let video_extensions = [
         "mp4", "mkv", "avi", "mov", "flv", "wmv", "webm", "m4v", "mpg", "mpeg", "3gp",

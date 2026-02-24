@@ -39,6 +39,7 @@ impl EncoderType {
                 if check_nvenc_available()? {
                     Ok(Self::Gpu)
                 } else {
+                    println!("注意: NVENC不可用，使用CPU编码");
                     Ok(Self::Cpu)
                 }
             }

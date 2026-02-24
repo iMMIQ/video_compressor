@@ -92,9 +92,23 @@ fn main() -> Result<()> {
         anyhow::bail!("输入目录不存在: {}", args.input.display());
     }
 
+    // 解析编码器类型
+    let encoder_type = EncoderType::from_str(&args.encoder)?;
+    let encoder_type = encoder_type.resolve()?;
+    let encoder_config = EncoderConfig {
+        encoder_type,
+        preset: args.preset.clone(),
+    };
+    let encoder_name = match encoder_config.encoder_type {
+        EncoderType::Cpu => "CPU (libx265)",
+        EncoderType::Gpu => "GPU (hevc_nvenc)",
+        EncoderType::Auto => unreachable!("Auto should be resolved"),
+    };
+
     println!("视频压缩工具 (智能压缩模式)");
     println!("输入目录: {}", args.input.display());
     println!("输出模式: 原地替换（后缀名改为.mp4）");
+    println!("编码器: {}", encoder_name);
     println!("预览CRF: 23 | 最大CRF: {}", args.max_crf);
     println!("最小压缩比: {}%", args.min_compression_ratio);
     println!("编码预设: {}", args.preset);
@@ -102,7 +116,7 @@ fn main() -> Result<()> {
     println!("扫描视频中...\n");
 
     // 检查FFmpeg是否可用
-    check_ffmpeg()?;
+    check_ffmpeg(encoder_config.encoder_type)?;
 
     // 扫描视频文件
     let video_files = scan_videos(&args.input)?;
@@ -127,9 +141,9 @@ fn main() -> Result<()> {
 
         match process_video(
             video_path,
+            &encoder_config,
             args.max_crf,
             args.min_compression_ratio,
-            &args.preset,
             args.audio_bitrate,
         ) {
             Ok(ProcessResult::Converted(stats)) => {

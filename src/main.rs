@@ -655,6 +655,21 @@ fn full_encode(
         .len())
 }
 
+/// Check if NVENC encoder is available
+fn check_nvenc_available() -> Result<bool> {
+    let output = Command::new("ffmpeg")
+        .arg("-encoders")
+        .output()
+        .context("无法执行ffmpeg命令")?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    let encoders = String::from_utf8_lossy(&output.stdout);
+    Ok(encoders.contains("hevc_nvenc"))
+}
+
 fn check_ffmpeg() -> Result<()> {
     let output = Command::new("ffmpeg")
         .arg("-version")

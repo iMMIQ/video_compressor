@@ -67,6 +67,10 @@ struct Args {
     #[arg(long, default_value = "medium")]
     preset: String,
 
+    /// 视频编码器类型 (cpu, gpu, auto)
+    #[arg(long, default_value = "auto")]
+    encoder: String,
+
     /// 音频编码比特率（kbps），设为0保持原音频
     #[arg(short, long, default_value = "128")]
     audio_bitrate: u32,

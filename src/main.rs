@@ -623,21 +623,17 @@ fn full_encode(
     input_path: &Path,
     output_path: &Path,
     crf: u8,
-    preset: &str,
+    encoder_config: &EncoderConfig,
     audio_bitrate: u32,
 ) -> Result<u64> {
+    let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
         .arg("-i")
-        .arg(input_path)
-        .arg("-c:v")
-        .arg("libx265")
-        .arg("-crf")
-        .arg(crf.to_string())
-        .arg("-preset")
-        .arg(preset)
-        .arg("-x265-params")
-        .arg("fast=1:log-level=error");
+        .arg(input_path);
+    for arg in video_args {
+        cmd.arg(arg);
+    }
 
     // 音频处理
     if audio_bitrate > 0 {

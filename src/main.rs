@@ -672,10 +672,10 @@ fn check_nvenc_available() -> Result<bool> {
     }
 
     let encoders = String::from_utf8_lossy(&output.stdout);
-    // Check for hevc_nvenc as an actual encoder (starts with V followed by dots, then space, then hevc_nvenc)
+    // Check for hevc_nvenc as an actual encoder (V....D hevc_nvenc)
     let nvenc_available = encoders
         .lines()
-        .any(|line| line.starts_with('V') && line.split_whitespace().nth(1) == Some("hevc_nvenc"));
+        .any(|line| line.trim().starts_with('V') && line.contains("hevc_nvenc"));
     Ok(nvenc_available)
 }
 
@@ -704,7 +704,7 @@ fn check_ffmpeg(encoder_type: EncoderType) -> Result<()> {
 
     // 对于GPU模式，检查NVENC
     if matches!(encoder_type, EncoderType::Gpu) {
-        if version.contains("hevc_nvenc") {
+        if check_nvenc_available()? {
             println!("✓ NVENC编码器可用");
         } else {
             anyhow::bail!("FFmpeg未编译hevc_nvenc支持，无法使用GPU编码");

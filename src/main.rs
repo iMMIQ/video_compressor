@@ -672,7 +672,11 @@ fn check_nvenc_available() -> Result<bool> {
     }
 
     let encoders = String::from_utf8_lossy(&output.stdout);
-    Ok(encoders.contains("hevc_nvenc"))
+    // Check for hevc_nvenc as an actual encoder (starts with V followed by dots, then space, then hevc_nvenc)
+    let nvenc_available = encoders
+        .lines()
+        .any(|line| line.starts_with('V') && line.split_whitespace().nth(1) == Some("hevc_nvenc"));
+    Ok(nvenc_available)
 }
 
 fn check_ffmpeg(encoder_type: EncoderType) -> Result<()> {

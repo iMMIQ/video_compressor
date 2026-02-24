@@ -688,7 +688,7 @@ fn check_nvenc_available() -> Result<bool> {
     Ok(encoders.contains("hevc_nvenc"))
 }
 
-fn check_ffmpeg() -> Result<()> {
+fn check_ffmpeg(encoder_type: EncoderType) -> Result<()> {
     let output = Command::new("ffmpeg")
         .arg("-version")
         .output()
@@ -709,6 +709,15 @@ fn check_ffmpeg() -> Result<()> {
         println!("✓ H.265编码器可用");
     } else {
         anyhow::bail!("FFmpeg未编译libx265支持，无法进行H.265编码");
+    }
+
+    // 对于GPU模式，检查NVENC
+    if matches!(encoder_type, EncoderType::Gpu) {
+        if version.contains("hevc_nvenc") {
+            println!("✓ NVENC编码器可用");
+        } else {
+            anyhow::bail!("FFmpeg未编译hevc_nvenc支持，无法使用GPU编码");
+        }
     }
 
     Ok(())

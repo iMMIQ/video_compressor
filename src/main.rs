@@ -237,9 +237,9 @@ fn safe_move_file(from: &Path, to: &Path) -> Result<()> {
 
 fn process_video(
     input_path: &Path,
+    encoder_config: &EncoderConfig,
     max_crf: u8,
     min_compression_ratio: u8,
-    preset: &str,
     audio_bitrate: u32,
 ) -> Result<ProcessResult> {
     const PREVIEW_CRF: u8 = 23;  // 固定预览CRF
@@ -295,7 +295,7 @@ fn process_video(
     let preview_result = preview_encode(
         input_path,
         PREVIEW_CRF,
-        preset,
+        encoder_config,
         audio_bitrate,
         preview_duration,
         duration,
@@ -360,7 +360,7 @@ fn process_video(
     let temp_path = temp_file.path();
 
     // 执行完整编码
-    let output_size = full_encode(input_path, temp_path, final_crf, preset, audio_bitrate)?;
+    let output_size = full_encode(input_path, temp_path, final_crf, encoder_config, audio_bitrate)?;
 
     let actual_ratio = 1.0 - output_size as f64 / input_size as f64;
     println!(

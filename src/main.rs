@@ -404,7 +404,7 @@ struct PreviewResult {
 fn preview_encode(
     input_path: &Path,
     crf: u8,
-    preset: &str,
+    encoder_config: &EncoderConfig,
     audio_bitrate: u32,
     duration: u32,
     video_duration: f64,
@@ -443,21 +443,16 @@ fn preview_encode(
         let _keep = temp_segment;
 
         // 对原始片段进行H.265编码（包含音频处理，与完整编码一致）
+        let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
         let mut encode_cmd = Command::new("ffmpeg");
         encode_cmd
             .arg("-y")
             .arg("-i")
-            .arg(&segment_paths[0])
-            .arg("-c:v")
-            .arg("libx265")
-            .arg("-crf")
-            .arg(crf.to_string())
-            .arg("-preset")
-            .arg(preset)
-            .arg("-x265-params")
-            .arg("fast=1:log-level=error")
-            .arg("-f")
-            .arg("mp4");
+            .arg(&segment_paths[0]);
+        for arg in video_args {
+            encode_cmd.arg(arg);
+        }
+        encode_cmd.arg("-f").arg("mp4");
 
         // 音频处理（与完整编码保持一致）
         if audio_bitrate > 0 {
@@ -569,6 +564,7 @@ fn preview_encode(
         std::fs::write(concat_list.path(), concat_content).context("无法写入concat列表")?;
 
         // 使用concat demuxer拼接并编码（包含音频处理，与完整编码一致）
+        let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
         let mut encode_cmd = Command::new("ffmpeg");
         encode_cmd
             .arg("-y")
@@ -577,17 +573,11 @@ fn preview_encode(
             .arg("-safe")
             .arg("0")
             .arg("-i")
-            .arg(concat_list.path())
-            .arg("-c:v")
-            .arg("libx265")
-            .arg("-crf")
-            .arg(crf.to_string())
-            .arg("-preset")
-            .arg(preset)
-            .arg("-x265-params")
-            .arg("fast=1:log-level=error")
-            .arg("-f")
-            .arg("mp4");
+            .arg(concat_list.path());
+        for arg in video_args {
+            encode_cmd.arg(arg);
+        }
+        encode_cmd.arg("-f").arg("mp4");
 
         // 音频处理（与完整编码保持一致）
         if audio_bitrate > 0 {

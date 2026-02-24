@@ -184,19 +184,21 @@ fn build_encode_args(crf: u8, preset: &str, config: &EncoderConfig) -> Vec<Strin
             "-tune".to_string(),
             "hq".to_string(),
             "-rc".to_string(),
-            "lookahead".to_string(),
+            "vbr".to_string(),
             "-rc-lookahead".to_string(),
             "32".to_string(),
             "-b_ref_mode".to_string(),
             "middle".to_string(),
-            "-b".to_string(),
-            "4".to_string(),
+            "-qmin".to_string(),
+            "24".to_string(),
+            "-qmax".to_string(),
+            "28".to_string(),
             "-init_qpP".to_string(),
-            "21".to_string(),
+            "24".to_string(),
             "-init_qpB".to_string(),
-            "23".to_string(),
+            "26".to_string(),
             "-init_qpI".to_string(),
-            "21".to_string(),
+            "24".to_string(),
             "-no-scenecut".to_string(),
             "0".to_string(),
             "-spatial_aq".to_string(),
@@ -771,5 +773,5 @@ This implementation adds NVIDIA NVENC GPU encoding support with the following ch
 
 GPU encoding uses:
 - `hevc_nvenc` encoder
-- `-preset p7 -tune hq -rc lookahead -rc-lookahead 32 -b_ref_mode middle -b 4 -init_qpP 21 -init_qpB 23 -init_qpI 21 -no-scenecut 0 -spatial_aq 1 -temporal_aq 1 -aq-strength 8` parameters
-- Fixed quality mode with init_qp values
+- `-preset p7 -tune hq -rc vbr -rc-lookahead 32 -b_ref_mode middle -qmin 24 -qmax 28 -init_qpP 24 -init_qpB 26 -init_qpI 24 -no-scenecut 0 -spatial_aq 1 -temporal_aq 1 -aq-strength 8` parameters
+- VBR rate control with qmin/qmax quality bounds

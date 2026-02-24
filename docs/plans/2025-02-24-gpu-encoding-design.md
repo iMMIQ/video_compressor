@@ -39,7 +39,7 @@ struct EncoderConfig {
 
 ### GPU Encoding (hevc_nvenc)
 ```
--c:v hevc_nvenc -preset p7 -tune hq -rc lookahead -rc-lookahead 32 -b_ref_mode middle -b 4 -init_qpP 21 -init_qpB 23 -init_qpI 21 -no-scenecut 0 -spatial_aq 1 -temporal_aq 1 -aq-strength 8
+-c:v hevc_nvenc -preset p7 -tune hq -rc vbr -rc-lookahead 32 -b_ref_mode middle -qmin 24 -qmax 28 -init_qpP 24 -init_qpB 26 -init_qpI 24 -no-scenecut 0 -spatial_aq 1 -temporal_aq 1 -aq-strength 8
 ```
 
 ### CPU Encoding (libx265)

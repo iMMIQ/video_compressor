@@ -736,7 +736,7 @@ fn build_encode_args(crf: u8, preset: &str, config: &EncoderConfig) -> Vec<Strin
             "-rc".to_string(),
             "vbr".to_string(),
             "-cq".to_string(),
-            crf.to_string(),  // 使用外推的 CRF 值，范围 0-51
+            (crf + 7).to_string(),  // GPU CQ = CPU CRF + 7 (NVENC CQ较高质量)
             "-rc-lookahead".to_string(),
             "32".to_string(),
             "-b_ref_mode".to_string(),

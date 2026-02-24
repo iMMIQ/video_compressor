@@ -246,7 +246,6 @@ fn process_video(
     const PREVIEW_CRF: u8 = 23;  // 固定预览CRF
     const PREVIEW_RATIO: f64 = 0.10;  // 预览时长为视频的10%
     const MIN_PREVIEW_SECONDS: u32 = 5;  // 最短预览5秒
-    const MAX_PREVIEW_SECONDS: u32 = 30; // 最长预览30秒
 
     // 获取输入文件元数据（用于后续恢复）
     let original_metadata = std::fs::metadata(input_path)
@@ -282,10 +281,10 @@ fn process_video(
         return Ok(ProcessResult::Skipped("已是H.265编码".to_string()));
     }
 
-    // 计算预览时长（10%时长，限制在5-30秒之间）
+    // 计算预览时长（10%时长，最短5秒）
     let preview_duration = if duration > 0.0 {
         let preview_from_ratio = (duration * PREVIEW_RATIO) as u32;
-        preview_from_ratio.max(MIN_PREVIEW_SECONDS).min(MAX_PREVIEW_SECONDS).min(duration as u32)
+        preview_from_ratio.max(MIN_PREVIEW_SECONDS).min(duration as u32)
     } else {
         MIN_PREVIEW_SECONDS
     };

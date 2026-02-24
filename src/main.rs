@@ -1,8 +1,12 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use filetime::{set_file_times, FileTime};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
@@ -46,6 +50,428 @@ impl EncoderType {
             other => Ok(other),
         }
     }
+}
+
+// ============================================================================
+// GPU 监控与并发控制
+// ============================================================================
+
+const MIN_CONCURRENT: usize = 1;
+const MAX_CONCURRENT: usize = 8;
+const MARGINAL_GAIN_THRESHOLD: u8 = 5;
+const UTILIZATION_HIGH: u8 = 95;
+
+/// GPU 利用率监控器
+struct GpuMonitor {
+    last_check: Instant,
+    cache_duration: Duration,
+    cached_utilization: u8,
+}
+
+impl GpuMonitor {
+    fn new() -> Self {
+        Self {
+            last_check: Instant::now() - Duration::from_secs(10),
+            cache_duration: Duration::from_secs(2),
+            cached_utilization: 0,
+        }
+    }
+
+    /// 获取 GPU 利用率（带缓存）
+    fn get_utilization(&mut self) -> Result<u8> {
+        if self.last_check.elapsed() < self.cache_duration {
+            return Ok(self.cached_utilization);
+        }
+
+        let output = Command::new("nvidia-smi")
+            .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+            .output()
+            .context("无法执行 nvidia-smi")?;
+
+        if !output.status.success() {
+            anyhow::bail!("nvidia-smi 执行失败");
+        }
+
+        let util_str = String::from_utf8_lossy(&output.stdout);
+        let util = util_str
+            .trim()
+            .parse::<u8>()
+            .unwrap_or(0);
+
+        self.cached_utilization = util;
+        self.last_check = Instant::now();
+        Ok(util)
+    }
+
+    /// 强制刷新缓存并获取最新值
+    fn force_refresh(&mut self) -> Result<u8> {
+        self.last_check = Instant::now() - Duration::from_secs(10);
+        self.get_utilization()
+    }
+}
+
+/// 并发调整动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcurrencyAction {
+    Increase,
+    Decrease,
+    Maintain,
+}
+
+/// 并发控制器
+struct ConcurrencyController {
+    current_max: usize,
+    history: Vec<(usize, u8)>,  // (并发数, GPU利用率)
+}
+
+impl ConcurrencyController {
+    fn new(initial: usize) -> Self {
+        Self {
+            current_max: initial.clamp(MIN_CONCURRENT, MAX_CONCURRENT),
+            history: Vec::new(),
+        }
+    }
+
+    /// 根据当前 GPU 利用率决定下一步操作
+    fn decide(&mut self, current_gpu_util: u8, current_running: usize) -> ConcurrencyAction {
+        self.history.push((current_running, current_gpu_util));
+
+        // 如果正在运行的任务数还不到当前最大值，先填满
+        if current_running < self.current_max {
+            return ConcurrencyAction::Maintain;
+        }
+
+        // GPU 过载，减少并发
+        if current_gpu_util > UTILIZATION_HIGH {
+            if self.current_max > MIN_CONCURRENT {
+                self.current_max -= 1;
+            }
+            return ConcurrencyAction::Decrease;
+        }
+
+        // 计算边际增益
+        let marginal_gain = self.calculate_marginal_gain();
+
+        if marginal_gain < MARGINAL_GAIN_THRESHOLD {
+            // 边际增益太小，保持现状
+            return ConcurrencyAction::Maintain;
+        }
+
+        // 还有提升空间，尝试增加
+        if self.current_max < MAX_CONCURRENT {
+            self.current_max += 1;
+            return ConcurrencyAction::Increase;
+        }
+
+        ConcurrencyAction::Maintain
+    }
+
+    /// 计算最近两次的边际增益
+    fn calculate_marginal_gain(&self) -> u8 {
+        if self.history.len() < 2 {
+            return 100; // 数据不足，假设有提升空间
+        }
+
+        let len = self.history.len();
+        // 找最近两个不同并发数的记录
+        let mut prev_idx = len - 1;
+        while prev_idx > 0 && self.history[prev_idx].0 == self.history[len - 1].0 {
+            prev_idx -= 1;
+        }
+
+        if prev_idx == 0 && self.history[0].0 == self.history[len - 1].0 {
+            return 100; // 没有可比较的数据
+        }
+
+        let (prev_jobs, prev_util) = self.history[prev_idx];
+        let (curr_jobs, curr_util) = self.history[len - 1];
+
+        if curr_jobs <= prev_jobs {
+            return 100;
+        }
+
+        // 每增加一个任务的增益
+        let gain = curr_util.saturating_sub(prev_util);
+        gain
+    }
+
+    fn current_max(&self) -> usize {
+        self.current_max
+    }
+}
+
+/// 探测结果
+struct ProbeResult {
+    gpu_impact: u8,  // 单任务对 GPU 利用率的影响
+}
+
+/// 对第一个视频进行探测，评估单任务 GPU 占用
+fn probe_gpu_impact(
+    first_video: &Path,
+    encoder_config: &EncoderConfig,
+    audio_bitrate: u32,
+) -> Result<ProbeResult> {
+    let mut monitor = GpuMonitor::new();
+
+    // 记录基线
+    let baseline_util = monitor.force_refresh()?;
+    println!("  探测: GPU 基线利用率 {}%", baseline_util);
+
+    // 执行一次简短的预览编码
+    let start = Instant::now();
+    let _ = preview_encode(first_video, 23, encoder_config, audio_bitrate, 5, 0.0);
+    let elapsed = start.elapsed();
+
+    // 获取编码期间的 GPU 利用率
+    let peak_util = monitor.force_refresh()?;
+    let gpu_impact = peak_util.saturating_sub(baseline_util).max(10); // 至少假设 10%
+
+    println!("  探测完成: 耗时 {:?}, GPU 影响 {}%", elapsed, gpu_impact);
+
+    Ok(ProbeResult { gpu_impact })
+}
+
+/// 根据探测结果估算初始并发数
+fn estimate_initial_concurrency(probe: &ProbeResult) -> usize {
+    if probe.gpu_impact == 0 {
+        return 2;
+    }
+    let estimated = 80 / probe.gpu_impact;
+    (estimated as usize).clamp(MIN_CONCURRENT, MAX_CONCURRENT)
+}
+
+// ============================================================================
+// 任务调度器
+// ============================================================================
+
+/// 任务执行结果
+#[derive(Debug)]
+enum TaskResult {
+    Completed { path: PathBuf, stats: FileStats },
+    Skipped { path: PathBuf, reason: String },
+    Failed { path: PathBuf, error: String },
+}
+
+/// 任务调度器
+struct TaskScheduler {
+    pending: Vec<PathBuf>,
+    running_count: Arc<Mutex<usize>>,
+    result_sender: Sender<TaskResult>,
+    result_receiver: Receiver<TaskResult>,
+    encoder_config: EncoderConfig,
+    max_crf: u8,
+    min_compression_ratio: u8,
+    audio_bitrate: u32,
+}
+
+impl TaskScheduler {
+    fn new(
+        videos: Vec<PathBuf>,
+        encoder_config: EncoderConfig,
+        max_crf: u8,
+        min_compression_ratio: u8,
+        audio_bitrate: u32,
+    ) -> Self {
+        let (sender, receiver) = unbounded();
+        Self {
+            pending: videos,
+            running_count: Arc::new(Mutex::new(0)),
+            result_sender: sender,
+            result_receiver: receiver,
+            encoder_config,
+            max_crf,
+            min_compression_ratio,
+            audio_bitrate,
+        }
+    }
+
+    /// 获取当前运行中的任务数
+    fn running_count(&self) -> usize {
+        *self.running_count.lock().unwrap()
+    }
+
+    /// 是否还有未完成的工作
+    fn has_pending_or_running(&self) -> bool {
+        !self.pending.is_empty() || self.running_count() > 0
+    }
+
+    /// 尝试启动新任务，直到达到指定并发数
+    fn spawn_up_to(&mut self, max_concurrent: usize) {
+        while self.running_count() < max_concurrent && !self.pending.is_empty() {
+            let video_path = self.pending.remove(0);
+            let sender = self.result_sender.clone();
+            let running_count = self.running_count.clone();
+            let config = self.encoder_config.clone();
+            let max_crf = self.max_crf;
+            let min_ratio = self.min_compression_ratio;
+            let audio_bitrate = self.audio_bitrate;
+
+            *running_count.lock().unwrap() += 1;
+
+            thread::spawn(move || {
+                let result = process_video(
+                    &video_path,
+                    &config,
+                    max_crf,
+                    min_ratio,
+                    audio_bitrate,
+                );
+
+                let task_result = match result {
+                    Ok(ProcessResult::Converted(stats)) => TaskResult::Completed {
+                        path: video_path,
+                        stats,
+                    },
+                    Ok(ProcessResult::Skipped(reason)) => TaskResult::Skipped {
+                        path: video_path,
+                        reason,
+                    },
+                    Err(e) => TaskResult::Failed {
+                        path: video_path,
+                        error: e.to_string(),
+                    },
+                };
+
+                *running_count.lock().unwrap() -= 1;
+                let _ = sender.send(task_result);
+            });
+        }
+    }
+
+    /// 尝试接收已完成的任务结果（非阻塞）
+    fn try_recv_result(&self) -> Option<TaskResult> {
+        self.result_receiver.try_recv().ok()
+    }
+
+    /// 剩余待处理数量
+    #[allow(dead_code)]
+    fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// 已完成的任务索引（用于进度显示）
+    #[allow(dead_code)]
+    fn total_count(&self, completed: usize) -> usize {
+        completed + self.running_count() + self.pending.len()
+    }
+}
+
+/// GPU 并行处理主函数
+fn run_gpu_parallel(
+    video_files: Vec<PathBuf>,
+    encoder_config: &EncoderConfig,
+    max_crf: u8,
+    min_compression_ratio: u8,
+    audio_bitrate: u32,
+    results: &mut ConversionStats,
+    total_videos: usize,
+) -> Result<()> {
+    if video_files.is_empty() {
+        return Ok(());
+    }
+
+    // 探测阶段：对第一个视频评估 GPU 影响
+    println!("=== GPU 并行探测阶段 ===");
+    let probe_result = probe_gpu_impact(&video_files[0], encoder_config, audio_bitrate)
+        .unwrap_or(ProbeResult { gpu_impact: 30 });
+
+    let initial_concurrency = estimate_initial_concurrency(&probe_result);
+    println!("初始并发数: {}", initial_concurrency);
+    println!("=== 开始并行处理 ===\n");
+
+    // 创建调度器和控制器
+    let mut scheduler = TaskScheduler::new(
+        video_files,
+        encoder_config.clone(),
+        max_crf,
+        min_compression_ratio,
+        audio_bitrate,
+    );
+    let mut controller = ConcurrencyController::new(initial_concurrency);
+    let mut monitor = GpuMonitor::new();
+
+    let mut completed_count = 0;
+
+    // 主循环
+    while scheduler.has_pending_or_running() {
+        // 1. 收集已完成的结果
+        while let Some(task_result) = scheduler.try_recv_result() {
+            completed_count += 1;
+            match task_result {
+                TaskResult::Completed { path, stats } => {
+                    results.successful += 1;
+                    results.total_input_size += stats.input_size;
+                    results.total_output_size += stats.output_size;
+                    println!(
+                        "[{}/{}] ✓ {} -> {} ({:.1}% 压缩)",
+                        completed_count,
+                        total_videos,
+                        path.display(),
+                        format_size(stats.output_size),
+                        (1.0 - stats.output_size as f64 / stats.input_size as f64) * 100.0
+                    );
+                }
+                TaskResult::Skipped { path, reason } => {
+                    results.skipped += 1;
+                    println!("[{}/{}] - 跳过: {} ({})", completed_count, total_videos, path.display(), reason);
+                }
+                TaskResult::Failed { path, error } => {
+                    results.failed += 1;
+                    println!("[{}/{}] ✗ 失败: {} ({})", completed_count, total_videos, path.display(), error);
+                }
+            }
+        }
+
+        // 2. 获取 GPU 状态并决定是否调整并发
+        let gpu_util = monitor.get_utilization().unwrap_or(0);
+        let running = scheduler.running_count();
+        let action = controller.decide(gpu_util, running);
+
+        // 3. 根据决策启动任务
+        let max_concurrent = controller.current_max();
+        scheduler.spawn_up_to(max_concurrent);
+
+        // 打印状态（仅在调整时）
+        if action != ConcurrencyAction::Maintain || running == 0 {
+            println!(
+                "  [状态] 运行: {} | 并发上限: {} | GPU: {}%",
+                running, max_concurrent, gpu_util
+            );
+        }
+
+        // 4. 短暂休眠避免忙等待
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    // 处理剩余的结果（确保所有任务都被统计）
+    while let Some(task_result) = scheduler.try_recv_result() {
+        completed_count += 1;
+        match task_result {
+            TaskResult::Completed { path, stats } => {
+                results.successful += 1;
+                results.total_input_size += stats.input_size;
+                results.total_output_size += stats.output_size;
+                println!(
+                    "[{}/{}] ✓ {} -> {} ({:.1}% 压缩)",
+                    completed_count,
+                    total_videos,
+                    path.display(),
+                    format_size(stats.output_size),
+                    (1.0 - stats.output_size as f64 / stats.input_size as f64) * 100.0
+                );
+            }
+            TaskResult::Skipped { path, reason } => {
+                results.skipped += 1;
+                println!("[{}/{}] - 跳过: {} ({})", completed_count, total_videos, path.display(), reason);
+            }
+            TaskResult::Failed { path, error } => {
+                results.failed += 1;
+                println!("[{}/{}] ✗ 失败: {} ({})", completed_count, total_videos, path.display(), error);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// 视频压缩工具 - 将视频递归转换为H.265格式以减小体积
@@ -130,41 +556,57 @@ fn main() -> Result<()> {
 
     // 执行转换
     let mut results = ConversionStats::default();
-    for (i, video_path) in video_files.iter().enumerate() {
-        println!("[{}/{}] 处理: {}", i + 1, video_files.len(), video_path.display());
+    let total_videos = video_files.len();
 
-        if args.dry_run {
-            // 生成输出路径用于显示
+    if args.dry_run {
+        // dry run 模式：顺序处理，只显示不执行
+        for (i, video_path) in video_files.iter().enumerate() {
+            println!("[{}/{}] 处理: {}", i + 1, total_videos, video_path.display());
             let output_path = get_output_path(video_path);
             println!("  -> (dry run) {}", output_path.display());
-            continue;
         }
-
-        match process_video(
-            video_path,
+    } else if matches!(encoder_config.encoder_type, EncoderType::Gpu) {
+        // GPU 模式：使用并行调度器
+        run_gpu_parallel(
+            video_files,
             &encoder_config,
             args.max_crf,
             args.min_compression_ratio,
             args.audio_bitrate,
-        ) {
-            Ok(ProcessResult::Converted(stats)) => {
-                results.successful += 1;
-                results.total_input_size += stats.input_size;
-                results.total_output_size += stats.output_size;
-                println!(
-                    "  ✓ {} -> {} ({:.1}% 压缩)",
-                    format_size(stats.input_size),
-                    format_size(stats.output_size),
-                    (1.0 - stats.output_size as f64 / stats.input_size as f64) * 100.0
-                );
-            }
-            Ok(ProcessResult::Skipped(reason)) => {
-                results.skipped += 1;
-                println!("  - 跳过: {}", reason);
-            }
-            Err(e) => {
-                results.failed += 1;
-                println!("  ✗ 失败: {}", e);
+            &mut results,
+            total_videos,
+        )?;
+    } else {
+        // CPU 模式：顺序处理（libx265 自动利用多核）
+        for (i, video_path) in video_files.iter().enumerate() {
+            println!("[{}/{}] 处理: {}", i + 1, total_videos, video_path.display());
+
+            match process_video(
+                video_path,
+                &encoder_config,
+                args.max_crf,
+                args.min_compression_ratio,
+                args.audio_bitrate,
+            ) {
+                Ok(ProcessResult::Converted(stats)) => {
+                    results.successful += 1;
+                    results.total_input_size += stats.input_size;
+                    results.total_output_size += stats.output_size;
+                    println!(
+                        "  ✓ {} -> {} ({:.1}% 压缩)",
+                        format_size(stats.input_size),
+                        format_size(stats.output_size),
+                        (1.0 - stats.output_size as f64 / stats.input_size as f64) * 100.0
+                    );
+                }
+                Ok(ProcessResult::Skipped(reason)) => {
+                    results.skipped += 1;
+                    println!("  - 跳过: {}", reason);
+                }
+                Err(e) => {
+                    results.failed += 1;
+                    println!("  ✗ 失败: {}", e);
+                }
             }
         }
     }
@@ -475,92 +917,72 @@ fn preview_encode(
 
         drop(_keep);
     } else {
-        // 多段采样：开头(0%)、中间(50%)、结尾(90%)
-        let segment_duration = duration / 3;
-        let remaining = duration % 3;
+        // 五段均匀采样：在10%、30%、50%、70%、90%位置采样
+        const NUM_SEGMENTS: u32 = 5;
+        // 采样位置（相对于视频时长的比例）
+        const SAMPLE_POSITIONS: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
 
-        let seg1_start = 0.0;
-        let seg2_start = video_duration * 0.5 - segment_duration as f64 / 2.0;
-        let seg3_start = video_duration * 0.9;
+        let segment_duration = duration / NUM_SEGMENTS;
+        let remaining = duration % NUM_SEGMENTS;
 
-        let seg2_start = seg2_start.max(0.0);
-        let seg3_start = seg3_start.max(0.0);
+        // 计算每段的起始时间
+        let seg_starts: Vec<f64> = SAMPLE_POSITIONS
+            .iter()
+            .map(|&pos| (video_duration * pos - segment_duration as f64 / 2.0).max(0.0))
+            .collect();
 
-        let seg1_dur = segment_duration;
-        let seg2_dur = segment_duration;
-        let seg3_dur = segment_duration + remaining;
+        // 每段时长（最后一段加上余数）
+        let seg_durs: Vec<u32> = (0..NUM_SEGMENTS)
+            .map(|i| {
+                if i == NUM_SEGMENTS - 1 {
+                    segment_duration + remaining
+                } else {
+                    segment_duration
+                }
+            })
+            .collect();
 
-        // 提取三个原始片段到临时文件
-        let temp_seg1 = NamedTempFile::with_suffix(".mp4").context("无法创建临时文件1")?;
-        let temp_seg2 = NamedTempFile::with_suffix(".mp4").context("无法创建临时文件2")?;
-        let temp_seg3 = NamedTempFile::with_suffix(".mp4").context("无法创建临时文件3")?;
+        // 提取五个原始片段到临时文件
+        let temp_segs: Vec<NamedTempFile> = (0..NUM_SEGMENTS)
+            .map(|i| NamedTempFile::with_suffix(".mp4").context(format!("无法创建临时文件{}", i + 1)))
+            .collect::<Result<Vec<_>>>()?;
 
-        // 提取第一段（保留音频）
-        let extract1 = Command::new("ffmpeg")
-            .arg("-y")
-            .arg("-ss")
-            .arg(format!("{:.1}", seg1_start))
-            .arg("-i")
-            .arg(input_path)
-            .arg("-t")
-            .arg(seg1_dur.to_string())
-            .arg("-c")
-            .arg("copy")
-            .arg(temp_seg1.path())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .context("提取片段1失败")?;
+        // 提取每一段
+        let mut extract_success = true;
+        for (i, temp_seg) in temp_segs.iter().enumerate() {
+            let extract = Command::new("ffmpeg")
+                .arg("-y")
+                .arg("-ss")
+                .arg(format!("{:.1}", seg_starts[i]))
+                .arg("-i")
+                .arg(input_path)
+                .arg("-t")
+                .arg(seg_durs[i].to_string())
+                .arg("-c")
+                .arg("copy")
+                .arg(temp_seg.path())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .context(format!("提取片段{}失败", i + 1))?;
 
-        // 提取第二段（保留音频）
-        let extract2 = Command::new("ffmpeg")
-            .arg("-y")
-            .arg("-ss")
-            .arg(format!("{:.1}", seg2_start))
-            .arg("-i")
-            .arg(input_path)
-            .arg("-t")
-            .arg(seg2_dur.to_string())
-            .arg("-c")
-            .arg("copy")
-            .arg(temp_seg2.path())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .context("提取片段2失败")?;
+            if !extract.status.success() {
+                extract_success = false;
+                break;
+            }
+        }
 
-        // 提取第三段（保留音频）
-        let extract3 = Command::new("ffmpeg")
-            .arg("-y")
-            .arg("-ss")
-            .arg(format!("{:.1}", seg3_start))
-            .arg("-i")
-            .arg(input_path)
-            .arg("-t")
-            .arg(seg3_dur.to_string())
-            .arg("-c")
-            .arg("copy")
-            .arg(temp_seg3.path())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .context("提取片段3失败")?;
-
-        if !extract1.status.success() || !extract2.status.success() || !extract3.status.success() {
-            drop(temp_seg1);
-            drop(temp_seg2);
-            drop(temp_seg3);
+        if !extract_success {
+            drop(temp_segs);
             anyhow::bail!("提取多段预览片段失败");
         }
 
         // 创建concat列表文件
         let concat_list = NamedTempFile::with_suffix(".txt").context("无法创建concat列表")?;
-        let concat_content = format!(
-            "file '{}'\nfile '{}'\nfile '{}'\n",
-            temp_seg1.path().display(),
-            temp_seg2.path().display(),
-            temp_seg3.path().display()
-        );
+        let concat_content = temp_segs
+            .iter()
+            .map(|seg| format!("file '{}'\n", seg.path().display()))
+            .collect::<String>();
         std::fs::write(concat_list.path(), concat_content).context("无法写入concat列表")?;
 
         // 使用concat demuxer拼接并编码（包含音频处理，与完整编码一致）
@@ -595,9 +1017,7 @@ fn preview_encode(
             .context("执行FFmpeg预览编码失败")?;
 
         drop(concat_list);
-        drop(temp_seg1);
-        drop(temp_seg2);
-        drop(temp_seg3);
+        drop(temp_segs);
 
         if !output.status.success() {
             anyhow::bail!("预览编码失败");

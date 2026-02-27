@@ -4,6 +4,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use filetime::{set_file_times, FileTime};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -232,12 +233,9 @@ fn probe_gpu_impact(
 }
 
 /// 根据探测结果估算初始并发数
-fn estimate_initial_concurrency(probe: &ProbeResult) -> usize {
-    if probe.gpu_impact == 0 {
-        return 2;
-    }
-    let estimated = 80 / probe.gpu_impact;
-    (estimated as usize).clamp(MIN_CONCURRENT, MAX_CONCURRENT)
+fn estimate_initial_concurrency(_probe: &ProbeResult) -> usize {
+    // 从 1 个线程开始，让并发控制器根据 GPU 利用率动态调整
+    1
 }
 
 // ============================================================================
@@ -252,21 +250,21 @@ enum TaskResult {
     Failed { path: PathBuf, error: String },
 }
 
-/// 任务调度器
+/// 任务调度器（支持动态添加任务）
 struct TaskScheduler {
-    pending: Vec<PathBuf>,
-    running_count: Arc<Mutex<usize>>,
+    pending: Mutex<Vec<PathBuf>>,
+    running_count: Arc<AtomicUsize>,
     result_sender: Sender<TaskResult>,
     result_receiver: Receiver<TaskResult>,
     encoder_config: EncoderConfig,
     max_crf: u8,
     min_compression_ratio: u8,
     audio_bitrate: u32,
+    scanning_done: Arc<AtomicBool>,
 }
 
 impl TaskScheduler {
     fn new(
-        videos: Vec<PathBuf>,
         encoder_config: EncoderConfig,
         max_crf: u8,
         min_compression_ratio: u8,
@@ -274,31 +272,60 @@ impl TaskScheduler {
     ) -> Self {
         let (sender, receiver) = unbounded();
         Self {
-            pending: videos,
-            running_count: Arc::new(Mutex::new(0)),
+            pending: Mutex::new(Vec::new()),
+            running_count: Arc::new(AtomicUsize::new(0)),
             result_sender: sender,
             result_receiver: receiver,
             encoder_config,
             max_crf,
             min_compression_ratio,
             audio_bitrate,
+            scanning_done: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 标记扫描完成
+    fn mark_scanning_done(&self) {
+        self.scanning_done.store(true, Ordering::SeqCst);
+    }
+
+    /// 动态添加任务
+    fn add_task(&self, video_path: PathBuf) {
+        self.pending.lock().unwrap().push(video_path);
     }
 
     /// 获取当前运行中的任务数
     fn running_count(&self) -> usize {
-        *self.running_count.lock().unwrap()
+        self.running_count.load(Ordering::SeqCst)
     }
 
     /// 是否还有未完成的工作
     fn has_pending_or_running(&self) -> bool {
-        !self.pending.is_empty() || self.running_count() > 0
+        let pending_empty = self.pending.lock().unwrap().is_empty();
+        let running = self.running_count() > 0;
+        let done = self.scanning_done.load(Ordering::SeqCst);
+
+        // 如果扫描未完成，总是返回 true（可能还有新任务）
+        // 如果扫描完成，检查是否还有待处理或运行中的任务
+        !done || !pending_empty || running
     }
 
     /// 尝试启动新任务，直到达到指定并发数
-    fn spawn_up_to(&mut self, max_concurrent: usize) {
-        while self.running_count() < max_concurrent && !self.pending.is_empty() {
-            let video_path = self.pending.remove(0);
+    fn spawn_up_to(&self, max_concurrent: usize) {
+        loop {
+            let running = self.running_count();
+            if running >= max_concurrent {
+                break;
+            }
+
+            let video_path = {
+                let mut pending = self.pending.lock().unwrap();
+                if pending.is_empty() {
+                    break;
+                }
+                pending.remove(0)
+            };
+
             let sender = self.result_sender.clone();
             let running_count = self.running_count.clone();
             let config = self.encoder_config.clone();
@@ -306,7 +333,7 @@ impl TaskScheduler {
             let min_ratio = self.min_compression_ratio;
             let audio_bitrate = self.audio_bitrate;
 
-            *running_count.lock().unwrap() += 1;
+            running_count.fetch_add(1, Ordering::SeqCst);
 
             thread::spawn(move || {
                 let result = process_video(
@@ -332,7 +359,7 @@ impl TaskScheduler {
                     },
                 };
 
-                *running_count.lock().unwrap() -= 1;
+                running_count.fetch_sub(1, Ordering::SeqCst);
                 let _ = sender.send(task_result);
             });
         }
@@ -346,47 +373,65 @@ impl TaskScheduler {
     /// 剩余待处理数量
     #[allow(dead_code)]
     fn pending_count(&self) -> usize {
-        self.pending.len()
-    }
-
-    /// 已完成的任务索引（用于进度显示）
-    #[allow(dead_code)]
-    fn total_count(&self, completed: usize) -> usize {
-        completed + self.running_count() + self.pending.len()
+        self.pending.lock().unwrap().len()
     }
 }
 
-/// GPU 并行处理主函数
+/// GPU 并行处理主函数（流式扫描）
 fn run_gpu_parallel(
-    video_files: Vec<PathBuf>,
+    input_dir: &Path,
     encoder_config: &EncoderConfig,
     max_crf: u8,
     min_compression_ratio: u8,
     audio_bitrate: u32,
     results: &mut ConversionStats,
-    total_videos: usize,
 ) -> Result<()> {
-    if video_files.is_empty() {
-        return Ok(());
+    // 创建调度器和控制器
+    let scheduler = Arc::new(TaskScheduler::new(
+        encoder_config.clone(),
+        max_crf,
+        min_compression_ratio,
+        audio_bitrate,
+    ));
+
+    // 启动扫描线程
+    let scheduler_clone = scheduler.clone();
+    let input_dir_clone = input_dir.to_path_buf();
+    let video_count = Arc::new(AtomicUsize::new(0));
+    let video_count_clone = video_count.clone();
+
+    let scanner_thread = thread::spawn(move || {
+        scan_videos_streaming(&input_dir_clone, |path| {
+            scheduler_clone.add_task(path);
+            video_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        scheduler_clone.mark_scanning_done();
+    });
+
+    // 等待第一个视频出现用于探测
+    while scheduler.pending_count() == 0 && !scheduler.scanning_done.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(50));
     }
 
     // 探测阶段：对第一个视频评估 GPU 影响
+    let first_video = {
+        let pending = scheduler.pending.lock().unwrap();
+        pending.first().cloned()
+    };
+
+    if first_video.is_none() {
+        scanner_thread.join().ok();
+        return Ok(());
+    }
+
     println!("=== GPU 并行探测阶段 ===");
-    let probe_result = probe_gpu_impact(&video_files[0], encoder_config, audio_bitrate)
+    let probe_result = probe_gpu_impact(first_video.as_ref().unwrap(), encoder_config, audio_bitrate)
         .unwrap_or(ProbeResult { gpu_impact: 30 });
 
     let initial_concurrency = estimate_initial_concurrency(&probe_result);
     println!("初始并发数: {}", initial_concurrency);
     println!("=== 开始并行处理 ===\n");
 
-    // 创建调度器和控制器
-    let mut scheduler = TaskScheduler::new(
-        video_files,
-        encoder_config.clone(),
-        max_crf,
-        min_compression_ratio,
-        audio_bitrate,
-    );
     let mut controller = ConcurrencyController::new(initial_concurrency);
     let mut monitor = GpuMonitor::new();
 
@@ -397,6 +442,7 @@ fn run_gpu_parallel(
         // 1. 收集已完成的结果
         while let Some(task_result) = scheduler.try_recv_result() {
             completed_count += 1;
+            let total = video_count.load(Ordering::SeqCst);
             match task_result {
                 TaskResult::Completed { path, stats } => {
                     results.successful += 1;
@@ -405,7 +451,7 @@ fn run_gpu_parallel(
                     println!(
                         "[{}/{}] ✓ {} -> {} ({:.1}% 压缩)",
                         completed_count,
-                        total_videos,
+                        total,
                         path.display(),
                         format_size(stats.output_size),
                         (1.0 - stats.output_size as f64 / stats.input_size as f64) * 100.0
@@ -413,11 +459,11 @@ fn run_gpu_parallel(
                 }
                 TaskResult::Skipped { path, reason } => {
                     results.skipped += 1;
-                    println!("[{}/{}] - 跳过: {} ({})", completed_count, total_videos, path.display(), reason);
+                    println!("[{}/{}] - 跳过: {} ({})", completed_count, total, path.display(), reason);
                 }
                 TaskResult::Failed { path, error } => {
                     results.failed += 1;
-                    println!("[{}/{}] ✗ 失败: {} ({})", completed_count, total_videos, path.display(), error);
+                    println!("[{}/{}] ✗ 失败: {} ({})", completed_count, total, path.display(), error);
                 }
             }
         }
@@ -433,9 +479,10 @@ fn run_gpu_parallel(
 
         // 打印状态（仅在调整时）
         if action != ConcurrencyAction::Maintain || running == 0 {
+            let total = video_count.load(Ordering::SeqCst);
             println!(
-                "  [状态] 运行: {} | 并发上限: {} | GPU: {}%",
-                running, max_concurrent, gpu_util
+                "  [状态] 运行: {} | 并发上限: {} | GPU: {}% | 已发现: {}",
+                running, max_concurrent, gpu_util, total
             );
         }
 
@@ -443,9 +490,13 @@ fn run_gpu_parallel(
         thread::sleep(Duration::from_millis(500));
     }
 
+    // 确保扫描线程结束
+    scanner_thread.join().ok();
+
     // 处理剩余的结果（确保所有任务都被统计）
     while let Some(task_result) = scheduler.try_recv_result() {
         completed_count += 1;
+        let total = video_count.load(Ordering::SeqCst);
         match task_result {
             TaskResult::Completed { path, stats } => {
                 results.successful += 1;
@@ -454,7 +505,7 @@ fn run_gpu_parallel(
                 println!(
                     "[{}/{}] ✓ {} -> {} ({:.1}% 压缩)",
                     completed_count,
-                    total_videos,
+                    total,
                     path.display(),
                     format_size(stats.output_size),
                     (1.0 - stats.output_size as f64 / stats.input_size as f64) * 100.0
@@ -462,11 +513,11 @@ fn run_gpu_parallel(
             }
             TaskResult::Skipped { path, reason } => {
                 results.skipped += 1;
-                println!("[{}/{}] - 跳过: {} ({})", completed_count, total_videos, path.display(), reason);
+                println!("[{}/{}] - 跳过: {} ({})", completed_count, total, path.display(), reason);
             }
             TaskResult::Failed { path, error } => {
                 results.failed += 1;
-                println!("[{}/{}] ✗ 失败: {} ({})", completed_count, total_videos, path.display(), error);
+                println!("[{}/{}] ✗ 失败: {} ({})", completed_count, total, path.display(), error);
             }
         }
     }
@@ -509,6 +560,10 @@ struct Args {
     /// 并发处理任务数
     #[arg(short, long, default_value = "1")]
     jobs: usize,
+
+    /// 强制串行处理（禁用GPU并行编码）
+    #[arg(long, default_value = "false")]
+    serial: bool,
 }
 
 fn main() -> Result<()> {
@@ -540,49 +595,56 @@ fn main() -> Result<()> {
     println!("最小压缩比: {}%", args.min_compression_ratio);
     println!("编码预设: {}", args.preset);
     println!("音频比特率: {}kbps", args.audio_bitrate);
-    println!("扫描视频中...\n");
 
     // 检查FFmpeg是否可用
     check_ffmpeg(encoder_config.encoder_type)?;
 
-    // 扫描视频文件
-    let video_files = scan_videos(&args.input)?;
-    println!("找到 {} 个视频文件\n", video_files.len());
-
-    if video_files.is_empty() {
-        println!("未找到任何视频文件。");
-        return Ok(());
-    }
-
     // 执行转换
     let mut results = ConversionStats::default();
-    let total_videos = video_files.len();
 
     if args.dry_run {
-        // dry run 模式：顺序处理，只显示不执行
-        for (i, video_path) in video_files.iter().enumerate() {
-            println!("[{}/{}] 处理: {}", i + 1, total_videos, video_path.display());
-            let output_path = get_output_path(video_path);
+        // dry run 模式：流式扫描，只显示不执行
+        println!("扫描视频中...\n");
+        let mut count = 0;
+        scan_videos_streaming(&args.input, |path| {
+            count += 1;
+            println!("[{}] 处理: {}", count, path.display());
+            let output_path = get_output_path(&path);
             println!("  -> (dry run) {}", output_path.display());
-        }
-    } else if matches!(encoder_config.encoder_type, EncoderType::Gpu) {
-        // GPU 模式：使用并行调度器
+        });
+        println!("\n共找到 {} 个视频文件", count);
+    } else if matches!(encoder_config.encoder_type, EncoderType::Gpu) && !args.serial {
+        // GPU 模式：使用并行调度器（流式扫描）
+        println!("开始流式扫描和处理...\n");
         run_gpu_parallel(
-            video_files,
+            &args.input,
             &encoder_config,
             args.max_crf,
             args.min_compression_ratio,
             args.audio_bitrate,
             &mut results,
-            total_videos,
         )?;
     } else {
-        // CPU 模式：顺序处理（libx265 自动利用多核）
-        for (i, video_path) in video_files.iter().enumerate() {
-            println!("[{}/{}] 处理: {}", i + 1, total_videos, video_path.display());
+        // CPU 模式 或 GPU 串行模式：流式顺序处理
+        println!("开始流式扫描和处理...\n");
+        let mut count = 0;
+        let (sender, receiver) = unbounded::<PathBuf>();
+
+        // 扫描线程
+        let input_clone = args.input.clone();
+        let scan_thread = thread::spawn(move || {
+            scan_videos_streaming(&input_clone, |path| {
+                let _ = sender.send(path);
+            });
+        });
+
+        // 主线程处理
+        while let Ok(video_path) = receiver.recv() {
+            count += 1;
+            println!("[{}] 处理: {}", count, video_path.display());
 
             match process_video(
-                video_path,
+                &video_path,
                 &encoder_config,
                 args.max_crf,
                 args.min_compression_ratio,
@@ -609,6 +671,8 @@ fn main() -> Result<()> {
                 }
             }
         }
+
+        scan_thread.join().ok();
     }
 
     // 输出统计信息
@@ -885,12 +949,14 @@ fn preview_encode(
         let _keep = temp_segment;
 
         // 对原始片段进行H.265编码（包含音频处理，与完整编码一致）
+        let decode_args = build_decode_args(encoder_config);
         let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
         let mut encode_cmd = Command::new("ffmpeg");
-        encode_cmd
-            .arg("-y")
-            .arg("-i")
-            .arg(&segment_paths[0]);
+        encode_cmd.arg("-y");
+        for arg in &decode_args {
+            encode_cmd.arg(arg);
+        }
+        encode_cmd.arg("-i").arg(&segment_paths[0]);
         for arg in video_args {
             encode_cmd.arg(arg);
         }
@@ -986,10 +1052,14 @@ fn preview_encode(
         std::fs::write(concat_list.path(), concat_content).context("无法写入concat列表")?;
 
         // 使用concat demuxer拼接并编码（包含音频处理，与完整编码一致）
+        let decode_args = build_decode_args(encoder_config);
         let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
         let mut encode_cmd = Command::new("ffmpeg");
+        encode_cmd.arg("-y");
+        for arg in &decode_args {
+            encode_cmd.arg(arg);
+        }
         encode_cmd
-            .arg("-y")
             .arg("-f")
             .arg("concat")
             .arg("-safe")
@@ -1046,11 +1116,14 @@ fn full_encode(
     encoder_config: &EncoderConfig,
     audio_bitrate: u32,
 ) -> Result<u64> {
+    let decode_args = build_decode_args(encoder_config);
     let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
     let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y")
-        .arg("-i")
-        .arg(input_path);
+    cmd.arg("-y");
+    for arg in decode_args {
+        cmd.arg(arg);
+    }
+    cmd.arg("-i").arg(input_path);
     for arg in video_args {
         cmd.arg(arg);
     }
@@ -1133,6 +1206,17 @@ fn check_ffmpeg(encoder_type: EncoderType) -> Result<()> {
     Ok(())
 }
 
+/// Build hardware decode arguments for FFmpeg (GPU mode only)
+fn build_decode_args(config: &EncoderConfig) -> Vec<String> {
+    match config.encoder_type {
+        EncoderType::Gpu => vec![
+            "-hwaccel".to_string(),
+            "cuda".to_string(),
+        ],
+        _ => vec![],
+    }
+}
+
 /// Build video encoder arguments for FFmpeg
 fn build_encode_args(crf: u8, preset: &str, config: &EncoderConfig) -> Vec<String> {
     match config.encoder_type {
@@ -1174,30 +1258,38 @@ fn build_encode_args(crf: u8, preset: &str, config: &EncoderConfig) -> Vec<Strin
     }
 }
 
-fn scan_videos(dir: &Path) -> Result<Vec<PathBuf>> {
+/// 流式扫描视频文件（边扫描边处理回调）
+fn scan_videos_streaming<F>(dir: &Path, mut callback: F)
+where
+    F: FnMut(PathBuf),
+{
     let video_extensions = [
         "mp4", "mkv", "avi", "mov", "flv", "wmv", "webm", "m4v", "mpg", "mpeg", "3gp",
     ];
 
-    let mut videos = Vec::new();
-
-    for entry in WalkDir::new(dir)
+    // 使用 min_depth(1) 避免处理根目录本身
+    let mut entries: Vec<_> = WalkDir::new(dir)
         .follow_links(true)
+        .min_depth(1)
         .into_iter()
         .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if video_extensions.contains(&ext.to_lowercase().as_str()) {
-                    videos.push(path.to_path_buf());
-                }
-            }
-        }
-    }
+        .filter(|e| e.path().is_file())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| video_extensions.contains(&ext.to_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
 
-    videos.sort();
-    Ok(videos)
+    // 排序保证处理顺序一致
+    entries.sort();
+
+    for path in entries {
+        callback(path);
+    }
 }
 
 #[derive(Debug)]

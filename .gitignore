@@ -1,0 +1,9 @@
+/target
+/Cargo.lock
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.flv
+*.wmv
+*.webm

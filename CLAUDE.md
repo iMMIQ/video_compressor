@@ -11,6 +11,15 @@ Video Compressor - A Rust tool that recursively converts videos to H.265/HEVC fo
 - Maximum CRF limit of 35 (skip video if extrapolated CRF > 35)
 - H.264 sources must achieve 30% compression or conversion is skipped
 
+## Encoder Support
+
+Three encoder types are supported:
+- **CPU (libx265)**: Software encoding, universal compatibility
+- **GPU (hevc_nvenc)**: NVIDIA hardware encoding via NVENC
+- **Jetson (hevc_nvmpi)**: NVIDIA Jetson Orin hardware encoding via NVMPI
+
+Use `--encoder auto` to automatically detect the best available encoder.
+
 ## Build Commands
 
 ### Standard build (dynamic linking):
@@ -59,18 +68,38 @@ cargo run -- --input /path/to/videos --encoder cpu
 
 ## Architecture
 
-## Architecture
+The application is a modular CLI tool with the following structure:
 
-The application is a single-binary CLI tool:
+```
+src/
+├── main.rs       # Entry point, CLI parsing with clap
+├── config.rs     # EncoderConfig, EncoderType definitions
+├── encoder.rs    # Encoding logic (preview/full encode)
+├── ffmpeg.rs     # FFmpeg/ffprobe invocations, encoder detection
+├── gpu.rs        # NVENC/NVMPI availability checks
+├── scheduler.rs  # GPU parallel processing scheduler
+├── scanner.rs    # Streaming video file discovery
+├── utils.rs      # Helper functions (size formatting, path handling)
+└── video.rs      # Video processing workflow (process_video)
+```
+
+### Processing Pipeline
 
 1. **CLI parsing** (`Args` struct) - clap derive API for argument parsing
-2. **Encoder detection** (`check_nvenc_available`) - Verifies NVENC support for GPU encoding
-3. **FFmpeg detection** (`check_ffmpeg`) - Verifies FFmpeg and libx265/hevc_nvenc support
-4. **Video scanning** (`scan_videos`) - walkdir for recursive file discovery
+2. **Encoder detection** (`resolve_encoder_type`) - Resolves encoder type (auto/cpu/gpu/jetson)
+3. **FFmpeg detection** (`check_ffmpeg`) - Verifies FFmpeg and encoder support
+4. **Streaming scan** (`scan_videos_streaming`) - walkdir for recursive file discovery with callback
 5. **Video info** (`get_video_info`) - ffprobe for codec, resolution, duration
 6. **Preview encoding** (`preview_encode`) - Encodes 10% duration at CRF=23
 7. **CRF extrapolation** - Uses exponential formula if compression insufficient
 8. **Full encoding** (`full_encode`) - Complete conversion with selected CRF
+
+### GPU Parallel Processing
+
+When using GPU encoding (`--encoder gpu` or `--encoder jetson`), the scheduler enables parallel processing:
+- Multiple videos encoded simultaneously (controlled by `--jobs`)
+- Dynamic concurrency based on encoder queue capacity
+- Use `--serial` to disable parallel processing
 
 ### Key Algorithm (process_video)
 
@@ -112,3 +141,4 @@ Located in `.cargo/config.toml`:
 - `anyhow` - Error handling
 - `walkdir` - Recursive directory traversal
 - `tempfile` - Temporary files for preview encoding
+- `crossbeam-channel` - Thread communication for streaming processing

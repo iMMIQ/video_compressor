@@ -196,7 +196,7 @@ pub fn run_gpu_parallel(
     println!("=== 开始并行处理 ===\n");
 
     let mut controller = ConcurrencyController::new(initial_concurrency);
-    let mut monitor = GpuMonitor::new();
+    let mut monitor = GpuMonitor::new_for_encoder(encoder_config.encoder_type);
 
     let mut completed_count = 0;
 

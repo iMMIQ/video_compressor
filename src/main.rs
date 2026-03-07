@@ -40,7 +40,7 @@ struct Args {
     #[arg(long, default_value = "medium")]
     preset: String,
 
-    /// Video encoder type (cpu, gpu, auto)
+    /// Video encoder type (cpu, gpu, jetson, auto)
     #[arg(long, default_value = "auto")]
     encoder: String,
 
@@ -78,6 +78,7 @@ fn main() -> Result<()> {
     let encoder_name = match encoder_config.encoder_type {
         EncoderType::Cpu => "CPU (libx265)",
         EncoderType::Gpu => "GPU (hevc_nvenc)",
+        EncoderType::Jetson => "Jetson GPU (hevc_nvmpi)",
     };
 
     println!("视频压缩工具 (智能压缩模式)");
@@ -106,7 +107,7 @@ fn main() -> Result<()> {
             println!("  -> (dry run) {}", output_path.display());
         });
         println!("\n共找到 {} 个视频文件", count);
-    } else if matches!(encoder_config.encoder_type, EncoderType::Gpu) && !args.serial {
+    } else if matches!(encoder_config.encoder_type, EncoderType::Gpu | EncoderType::Jetson) && !args.serial {
         // GPU mode: use parallel scheduler (streaming scan)
         println!("开始流式扫描和处理...\n");
         run_gpu_parallel(

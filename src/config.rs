@@ -2,7 +2,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderType {
     Cpu,
-    Gpu,
+    Gpu,      // Standard NVENC (desktop GPUs)
+    Jetson,   // Jetson NVMPI (Jetson devices)
 }
 
 /// Encoder configuration

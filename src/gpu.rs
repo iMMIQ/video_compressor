@@ -1,6 +1,7 @@
-use crate::config::EncoderConfig;
+use crate::config::{EncoderConfig, EncoderType};
 use crate::encoder::preview_encode;
 use anyhow::{Context, Result};
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -10,19 +11,27 @@ const MAX_CONCURRENT: usize = 8;
 const MARGINAL_GAIN_THRESHOLD: u8 = 5;
 const UTILIZATION_HIGH: u8 = 95;
 
+/// Jetson GPU load sysfs paths (tried in order)
+const JETSON_GPU_LOAD_PATHS: &[&str] = &[
+    "/sys/devices/platform/17000000.gpu/load",
+    "/sys/devices/platform/gpu.0/load",
+];
+
 /// GPU utilization monitor
 pub struct GpuMonitor {
     last_check: Instant,
     cache_duration: Duration,
     cached_utilization: u8,
+    is_jetson: bool,
 }
 
 impl GpuMonitor {
-    pub fn new() -> Self {
+    pub fn new_for_encoder(encoder_type: EncoderType) -> Self {
         Self {
             last_check: Instant::now() - Duration::from_secs(10),
             cache_duration: Duration::from_secs(2),
             cached_utilization: 0,
+            is_jetson: matches!(encoder_type, EncoderType::Jetson),
         }
     }
 
@@ -32,6 +41,32 @@ impl GpuMonitor {
             return Ok(self.cached_utilization);
         }
 
+        let util = if self.is_jetson {
+            self.read_jetson_gpu_load()?
+        } else {
+            self.read_nvidia_smi_load()?
+        };
+
+        self.cached_utilization = util;
+        self.last_check = Instant::now();
+        Ok(util)
+    }
+
+    /// Read GPU load from Jetson sysfs (value 0-1000, maps to 0-100%)
+    fn read_jetson_gpu_load(&self) -> Result<u8> {
+        for path in JETSON_GPU_LOAD_PATHS {
+            if let Ok(content) = fs::read_to_string(path) {
+                let val: u32 = content.trim().parse().unwrap_or(0);
+                // sysfs load is 0-1000 (permille), convert to 0-100
+                return Ok((val / 10).min(100) as u8);
+            }
+        }
+        // Fallback: if sysfs not readable, return 50% as safe default
+        Ok(50)
+    }
+
+    /// Read GPU load from nvidia-smi (desktop GPUs)
+    fn read_nvidia_smi_load(&self) -> Result<u8> {
         let output = Command::new("nvidia-smi")
             .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
             .output()
@@ -42,11 +77,7 @@ impl GpuMonitor {
         }
 
         let util_str = String::from_utf8_lossy(&output.stdout);
-        let util = util_str.trim().parse::<u8>().unwrap_or(0);
-
-        self.cached_utilization = util;
-        self.last_check = Instant::now();
-        Ok(util)
+        Ok(util_str.trim().parse::<u8>().unwrap_or(0))
     }
 
     /// Force refresh cache and get latest value
@@ -158,7 +189,7 @@ pub fn probe_gpu_impact(
     encoder_config: &EncoderConfig,
     audio_bitrate: u32,
 ) -> Result<ProbeResult> {
-    let mut monitor = GpuMonitor::new();
+    let mut monitor = GpuMonitor::new_for_encoder(encoder_config.encoder_type);
 
     // Record baseline
     let baseline_util = monitor.force_refresh()?;

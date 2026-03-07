@@ -15,7 +15,7 @@ pub struct VideoInfo {
     pub bitrate: u64,
 }
 
-/// Check if NVENC encoder is available
+/// Check if NVENC encoder is available (desktop GPUs)
 pub fn check_nvenc_available() -> Result<bool> {
     let output = Command::new("ffmpeg")
         .arg("-encoders")
@@ -27,11 +27,28 @@ pub fn check_nvenc_available() -> Result<bool> {
     }
 
     let encoders = String::from_utf8_lossy(&output.stdout);
-    // Check for hevc_nvenc as an actual encoder (V....D hevc_nvenc)
     let nvenc_available = encoders
         .lines()
         .any(|line| line.trim().starts_with('V') && line.contains("hevc_nvenc"));
     Ok(nvenc_available)
+}
+
+/// Check if NVMPI encoder is available (Jetson devices)
+pub fn check_nvmpi_available() -> Result<bool> {
+    let output = Command::new("ffmpeg")
+        .arg("-encoders")
+        .output()
+        .context("无法执行ffmpeg命令")?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    let encoders = String::from_utf8_lossy(&output.stdout);
+    let nvmpi_available = encoders
+        .lines()
+        .any(|line| line.trim().starts_with('V') && line.contains("hevc_nvmpi"));
+    Ok(nvmpi_available)
 }
 
 pub fn check_ffmpeg(encoder_type: EncoderType) -> Result<()> {
@@ -57,13 +74,22 @@ pub fn check_ffmpeg(encoder_type: EncoderType) -> Result<()> {
         anyhow::bail!("FFmpeg未编译libx265支持，无法进行H.265编码");
     }
 
-    // For GPU mode, check NVENC
-    if matches!(encoder_type, EncoderType::Gpu) {
-        if check_nvenc_available()? {
-            println!("✓ NVENC编码器可用");
-        } else {
-            anyhow::bail!("FFmpeg未编译hevc_nvenc支持，无法使用GPU编码");
+    match encoder_type {
+        EncoderType::Gpu => {
+            if check_nvenc_available()? {
+                println!("✓ NVENC编码器可用");
+            } else {
+                anyhow::bail!("FFmpeg未编译hevc_nvenc支持，无法使用GPU编码");
+            }
         }
+        EncoderType::Jetson => {
+            if check_nvmpi_available()? {
+                println!("✓ NVMPI编码器可用 (Jetson)");
+            } else {
+                anyhow::bail!("FFmpeg未编译hevc_nvmpi支持，无法使用Jetson GPU编码。请参考jetson-ffmpeg编译指南");
+            }
+        }
+        EncoderType::Cpu => {}
     }
 
     Ok(())
@@ -112,15 +138,20 @@ pub fn resolve_encoder_type(s: &str) -> Result<EncoderType> {
     match s.to_lowercase().as_str() {
         "cpu" => Ok(EncoderType::Cpu),
         "gpu" => Ok(EncoderType::Gpu),
+        "jetson" => Ok(EncoderType::Jetson),
         "auto" => {
+            // Check NVENC first (desktop GPU), then NVMPI (Jetson)
             if check_nvenc_available()? {
                 println!("注意: 使用GPU编码 (NVENC可用)");
                 Ok(EncoderType::Gpu)
+            } else if check_nvmpi_available()? {
+                println!("注意: 使用Jetson GPU编码 (NVMPI可用)");
+                Ok(EncoderType::Jetson)
             } else {
-                println!("注意: NVENC不可用，使用CPU编码");
+                println!("注意: 无GPU编码器可用，使用CPU编码");
                 Ok(EncoderType::Cpu)
             }
         }
-        _ => anyhow::bail!("Invalid encoder type: {}. Use: cpu, gpu, or auto", s),
+        _ => anyhow::bail!("Invalid encoder type: {}. Use: cpu, gpu, jetson, or auto", s),
     }
 }

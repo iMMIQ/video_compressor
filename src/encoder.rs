@@ -12,6 +12,7 @@ pub struct PreviewResult {
 pub fn build_decode_args(config: &EncoderConfig) -> Vec<String> {
     match config.encoder_type {
         EncoderType::Gpu => vec!["-hwaccel".to_string(), "cuda".to_string()],
+        // Jetson nvmpi: no hwaccel flag needed, decoder is specified separately if desired
         _ => vec![],
     }
 }
@@ -39,7 +40,7 @@ pub fn build_encode_args(crf: u8, preset: &str, config: &EncoderConfig) -> Vec<S
             "-rc".to_string(),
             "vbr".to_string(),
             "-cq".to_string(),
-            (crf + 7).to_string(), // GPU CQ = CPU CRF + 7 (NVENC CQ for higher quality)
+            (crf + 7).to_string(),
             "-rc-lookahead".to_string(),
             "32".to_string(),
             "-b_ref_mode".to_string(),
@@ -52,6 +53,14 @@ pub fn build_encode_args(crf: u8, preset: &str, config: &EncoderConfig) -> Vec<S
             "1".to_string(),
             "-aq-strength".to_string(),
             "8".to_string(),
+        ],
+        EncoderType::Jetson => vec![
+            "-c:v".to_string(),
+            "hevc_nvmpi".to_string(),
+            "-rc".to_string(),
+            "vbr".to_string(),
+            "-qp".to_string(),
+            (crf + 7).to_string(),
         ],
     }
 }

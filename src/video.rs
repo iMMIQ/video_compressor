@@ -1,4 +1,4 @@
-use crate::config::EncoderConfig;
+use crate::config::{EncoderConfig, EncoderType};
 use crate::encoder::{full_encode, preview_encode};
 use crate::ffmpeg::get_video_info;
 use crate::utils::{format_size, get_output_path, safe_move_file};
@@ -75,8 +75,13 @@ pub fn process_video(
         return Ok(ProcessResult::Skipped("已是H.265编码".to_string()));
     }
 
-    // Calculate preview duration (10% of video, minimum 5 seconds)
-    let preview_duration = if duration > 0.0 {
+    // Calculate preview duration
+    // For Jetson CPU preview: use shorter duration (3 seconds max) because Jetson CPU is slow
+    // For other encoders: 10% of video, minimum 5 seconds
+    let preview_duration = if encoder_config.encoder_type == EncoderType::Jetson {
+        // Jetson: use short CPU preview (3 seconds) for speed
+        3_u32.min(duration as u32)
+    } else if duration > 0.0 {
         let preview_from_ratio = (duration * PREVIEW_RATIO) as u32;
         preview_from_ratio
             .max(MIN_PREVIEW_SECONDS)
@@ -90,15 +95,71 @@ pub fn process_video(
         preview_duration, PREVIEW_CRF
     );
 
+    // For Jetson: preview encoding uses CPU to get baseline bitrate
+    // Then Jetson full encode uses target_bitrate = CPU_bitrate * 1.8
+    let (preview_config, jetson_target_bitrate) = if encoder_config.encoder_type == EncoderType::Jetson {
+        // Create CPU config for preview encoding
+        let cpu_config = EncoderConfig {
+            encoder_type: EncoderType::Cpu,
+            preset: encoder_config.preset.clone(),
+            target_bitrate_kbps: None,
+            use_2pass: false,
+        };
+        println!("  (Jetson: 使用CPU预览编码获取基准比特率)");
+        (cpu_config, true) // flag to calculate target bitrate later
+    } else {
+        (encoder_config.clone(), false)
+    };
+
     // Execute preview encode
     let preview_result = preview_encode(
         input_path,
         PREVIEW_CRF,
-        encoder_config,
+        &preview_config,
         audio_bitrate,
         preview_duration,
         duration,
     )?;
+
+    // For Jetson: calculate target bitrate from preview result
+    // CPU CRF23 bitrate * 2.0 = Jetson equivalent quality bitrate
+    // If that exceeds 70% of original bitrate, cap at 70% and use maxrate constraint
+    let final_encoder_config = if jetson_target_bitrate {
+        let cpu_bitrate_bps = preview_result.output_size_per_second * 8.0; // bytes/sec to bits/sec
+        let ideal_jetson_bitrate_kbps = (cpu_bitrate_bps * 2.0 / 1000.0) as u32;
+
+        // Calculate 70% of original video bitrate
+        let original_bitrate_kbps = if video_info.bitrate > 0 {
+            (video_info.bitrate / 1000) as u32
+        } else {
+            // Fallback: estimate from file size
+            ((input_size as f64 / duration) * 8.0 / 1000.0) as u32
+        };
+        let max_bitrate_kbps = (original_bitrate_kbps as f64 * 0.7) as u32;
+
+        let (final_bitrate_kbps, use_bitrate_cap) = if ideal_jetson_bitrate_kbps > max_bitrate_kbps {
+            println!(
+                "  Jetson: 理想比特率 {}kbps > 原始70% ({}kbps)，使用70%限制",
+                ideal_jetson_bitrate_kbps, max_bitrate_kbps
+            );
+            (max_bitrate_kbps, true)
+        } else {
+            println!(
+                "  Jetson目标比特率: {}kbps (CPU基准×2.0)",
+                ideal_jetson_bitrate_kbps
+            );
+            (ideal_jetson_bitrate_kbps, false)
+        };
+
+        EncoderConfig {
+            encoder_type: EncoderType::Jetson,
+            preset: encoder_config.preset.clone(),
+            target_bitrate_kbps: Some(final_bitrate_kbps),
+            use_2pass: use_bitrate_cap,
+        }
+    } else {
+        encoder_config.clone()
+    };
 
     // Calculate predicted compression ratio
     // Use preview output per-second size to estimate full video size
@@ -167,7 +228,7 @@ pub fn process_video(
     let temp_path = temp_file.path();
 
     // Execute full encode
-    let output_size = full_encode(input_path, temp_path, final_crf, encoder_config, audio_bitrate)?;
+    let output_size = full_encode(input_path, temp_path, final_crf, &final_encoder_config, audio_bitrate)?;
 
     let actual_ratio = 1.0 - output_size as f64 / input_size as f64;
     println!(

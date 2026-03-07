@@ -54,14 +54,46 @@ pub fn build_encode_args(crf: u8, preset: &str, config: &EncoderConfig) -> Vec<S
             "-aq-strength".to_string(),
             "8".to_string(),
         ],
-        EncoderType::Jetson => vec![
-            "-c:v".to_string(),
-            "hevc_nvmpi".to_string(),
-            "-rc".to_string(),
-            "vbr".to_string(),
-            "-qp".to_string(),
-            (crf + 7).to_string(),
-        ],
+        EncoderType::Jetson => {
+            // Jetson NVMPI does not support -qp parameter (it's ignored!)
+            // Must use -b:v bitrate control instead
+            let target_bitrate_kbps = config.target_bitrate_kbps.unwrap_or_else(|| {
+                // Fallback: CRF to bitrate mapping (approximate)
+                match crf {
+                    18..=22 => 1500, // High quality
+                    23..=26 => 1000, // Good quality (CRF 23)
+                    27..=30 => 700,  // Medium quality
+                    31..=35 => 500,  // Low quality
+                    _ => 800,        // Default
+                }
+            });
+
+            // For bitrate-capped mode (use_2pass=true), use maxrate constraint
+            // Jetson doesn't support true 2-pass, so we use maxrate to limit output
+            if config.use_2pass {
+                vec![
+                    "-c:v".to_string(),
+                    "hevc_nvmpi".to_string(),
+                    "-rc".to_string(),
+                    "vbr".to_string(),
+                    "-b:v".to_string(),
+                    format!("{}k", target_bitrate_kbps),
+                    "-maxrate".to_string(),
+                    format!("{}k", target_bitrate_kbps),
+                    "-bufsize".to_string(),
+                    format!("{}k", target_bitrate_kbps * 2),
+                ]
+            } else {
+                vec![
+                    "-c:v".to_string(),
+                    "hevc_nvmpi".to_string(),
+                    "-rc".to_string(),
+                    "vbr".to_string(),
+                    "-b:v".to_string(),
+                    format!("{}k", target_bitrate_kbps),
+                ]
+            }
+        }
     }
 }
 

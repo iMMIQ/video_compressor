@@ -74,6 +74,8 @@ fn main() -> Result<()> {
     let encoder_config = EncoderConfig {
         encoder_type,
         preset: args.preset.clone(),
+        target_bitrate_kbps: None, // Will be set dynamically for Jetson
+        use_2pass: false,
     };
     let encoder_name = match encoder_config.encoder_type {
         EncoderType::Cpu => "CPU (libx265)",

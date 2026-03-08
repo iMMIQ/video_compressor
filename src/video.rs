@@ -40,6 +40,7 @@ pub fn process_video(
     const PREVIEW_CRF: u8 = 23; // Fixed preview CRF
     const PREVIEW_RATIO: f64 = 0.10; // Preview duration is 10% of video
     const MIN_PREVIEW_SECONDS: u32 = 5; // Minimum 5 seconds preview
+    const JETSON_MAX_PREVIEW_SECONDS: u32 = 10; // Jetson CPU is slow, cap at 10s
 
     // Get input file metadata (for later restoration)
     let original_metadata =
@@ -75,17 +76,19 @@ pub fn process_video(
         return Ok(ProcessResult::Skipped("已是H.265编码".to_string()));
     }
 
-    // Calculate preview duration
-    // For Jetson CPU preview: use shorter duration (3 seconds max) because Jetson CPU is slow
-    // For other encoders: 10% of video, minimum 5 seconds
-    let preview_duration = if encoder_config.encoder_type == EncoderType::Jetson {
-        // Jetson: use short CPU preview (3 seconds) for speed
-        3_u32.min(duration as u32)
-    } else if duration > 0.0 {
+    // Calculate preview duration: 10% of video, minimum 5 seconds
+    // Jetson: cap at 10 seconds because CPU is slow
+    let preview_duration = if duration > 0.0 {
         let preview_from_ratio = (duration * PREVIEW_RATIO) as u32;
-        preview_from_ratio
+        let base_duration = preview_from_ratio
             .max(MIN_PREVIEW_SECONDS)
-            .min(duration as u32)
+            .min(duration as u32);
+
+        if encoder_config.encoder_type == EncoderType::Jetson {
+            base_duration.min(JETSON_MAX_PREVIEW_SECONDS)
+        } else {
+            base_duration
+        }
     } else {
         MIN_PREVIEW_SECONDS
     };

@@ -122,6 +122,7 @@ pub fn process_video(
         audio_bitrate,
         preview_duration,
         duration,
+        video_info.codec_name.as_deref(),
     )?;
 
     // For Jetson: calculate target bitrate from preview result
@@ -231,7 +232,7 @@ pub fn process_video(
     let temp_path = temp_file.path();
 
     // Execute full encode
-    let output_size = full_encode(input_path, temp_path, final_crf, &final_encoder_config, audio_bitrate)?;
+    let output_size = full_encode(input_path, temp_path, final_crf, &final_encoder_config, audio_bitrate, video_info.codec_name.as_deref())?;
 
     let actual_ratio = 1.0 - output_size as f64 / input_size as f64;
     println!(

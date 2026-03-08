@@ -197,7 +197,7 @@ pub fn probe_gpu_impact(
 
     // Execute a brief preview encode
     let start = Instant::now();
-    let _ = preview_encode(first_video, 23, encoder_config, audio_bitrate, 5, 0.0);
+    let _ = preview_encode(first_video, 23, encoder_config, audio_bitrate, 5, 0.0, None);
     let elapsed = start.elapsed();
 
     // Get GPU utilization during encoding

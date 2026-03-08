@@ -8,12 +8,33 @@ pub struct PreviewResult {
     pub output_size_per_second: f64, // Bytes per second after preview encoding
 }
 
-/// Build hardware decode arguments for FFmpeg (GPU mode only)
-pub fn build_decode_args(config: &EncoderConfig) -> Vec<String> {
+/// Map input codec name to Jetson nvmpi decoder name
+fn get_jetson_decoder(input_codec: &str) -> Option<&'static str> {
+    match input_codec.to_lowercase().as_str() {
+        "h264" | "avc" => Some("h264_nvmpi"),
+        "hevc" | "h265" => Some("hevc_nvmpi"),
+        "mpeg2" | "mpeg2video" => Some("mpeg2_nvmpi"),
+        "mpeg4" => Some("mpeg4_nvmpi"),
+        "vp8" => Some("vp8_nvmpi"),
+        "vp9" => Some("vp9_nvmpi"),
+        _ => None,
+    }
+}
+
+/// Build hardware decode arguments for FFmpeg
+pub fn build_decode_args(config: &EncoderConfig, input_codec: Option<&str>) -> Vec<String> {
     match config.encoder_type {
         EncoderType::Gpu => vec!["-hwaccel".to_string(), "cuda".to_string()],
-        // Jetson nvmpi: no hwaccel flag needed, decoder is specified separately if desired
-        _ => vec![],
+        EncoderType::Jetson => {
+            // Jetson nvmpi: use hardware decoder based on input codec
+            if let Some(codec) = input_codec {
+                if let Some(decoder) = get_jetson_decoder(codec) {
+                    return vec!["-c:v".to_string(), decoder.to_string()];
+                }
+            }
+            vec![]
+        }
+        EncoderType::Cpu => vec![],
     }
 }
 
@@ -104,6 +125,7 @@ pub fn preview_encode(
     audio_bitrate: u32,
     duration: u32,
     video_duration: f64,
+    input_codec: Option<&str>,
 ) -> Result<PreviewResult> {
     // Create temp file for output
     let temp_output = NamedTempFile::with_suffix(".mp4").context("无法创建临时文件")?;
@@ -139,7 +161,7 @@ pub fn preview_encode(
         let _keep = temp_segment;
 
         // Encode raw segment to H.265 (with audio processing, same as full encode)
-        let decode_args = build_decode_args(encoder_config);
+        let decode_args = build_decode_args(encoder_config, input_codec);
         let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
         let mut encode_cmd = Command::new("ffmpeg");
         encode_cmd.arg("-y");
@@ -249,7 +271,7 @@ pub fn preview_encode(
         std::fs::write(concat_list.path(), concat_content).context("无法写入concat列表")?;
 
         // Use concat demuxer to merge and encode (with audio processing, same as full encode)
-        let decode_args = build_decode_args(encoder_config);
+        let decode_args = build_decode_args(encoder_config, input_codec);
         let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
         let mut encode_cmd = Command::new("ffmpeg");
         encode_cmd.arg("-y");
@@ -316,8 +338,9 @@ pub fn full_encode(
     crf: u8,
     encoder_config: &EncoderConfig,
     audio_bitrate: u32,
+    input_codec: Option<&str>,
 ) -> Result<u64> {
-    let decode_args = build_decode_args(encoder_config);
+    let decode_args = build_decode_args(encoder_config, input_codec);
     let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y");

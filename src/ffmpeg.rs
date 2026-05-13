@@ -13,6 +13,7 @@ pub struct VideoInfo {
     pub duration: f64,
     #[allow(dead_code)]
     pub bitrate: u64,
+    pub pix_fmt: Option<String>,
 }
 
 /// Check if NVENC encoder is available (desktop GPUs)
@@ -102,7 +103,7 @@ pub fn get_video_info(path: &Path) -> Result<VideoInfo> {
         .arg("-select_streams")
         .arg("v:0")
         .arg("-show_entries")
-        .arg("stream=codec_name,width,height")
+        .arg("stream=codec_name,width,height,pix_fmt")
         .arg("-show_entries")
         .arg("format=duration,bit_rate")
         .arg("-of")
@@ -121,8 +122,9 @@ pub fn get_video_info(path: &Path) -> Result<VideoInfo> {
     let codec_name = lines.get(0).map(|s| s.to_string());
     let width = lines.get(1).and_then(|s| s.parse().ok()).unwrap_or(1920);
     let height = lines.get(2).and_then(|s| s.parse().ok()).unwrap_or(1080);
-    let duration = lines.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let bitrate = lines.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let pix_fmt = lines.get(3).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let duration = lines.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let bitrate = lines.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     Ok(VideoInfo {
         codec_name,
@@ -130,7 +132,20 @@ pub fn get_video_info(path: &Path) -> Result<VideoInfo> {
         height,
         duration,
         bitrate,
+        pix_fmt,
     })
+}
+
+/// Check if running on Jetson (Tegra) platform
+fn is_jetson_platform() -> bool {
+    // Check kernel release for "tegra" suffix
+    if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        if release.contains("tegra") {
+            return true;
+        }
+    }
+    // Check Jetson GPU sysfs path
+    std::path::Path::new("/sys/devices/platform/17000000.gpu/load").exists()
 }
 
 /// Resolve encoder type from string, handling "auto" detection
@@ -140,7 +155,17 @@ pub fn resolve_encoder_type(s: &str) -> Result<EncoderType> {
         "gpu" => Ok(EncoderType::Gpu),
         "jetson" => Ok(EncoderType::Jetson),
         "auto" => {
-            // Check NVENC first (desktop GPU), then NVMPI (Jetson)
+            if is_jetson_platform() {
+                // On Jetson (Tegra) platform, use NVMPI only;
+                // NVENC is compiled in but does NOT work at runtime
+                // (Host1x channel open failed, double free crash)
+                if check_nvmpi_available()? {
+                    println!("注意: 使用Jetson GPU编码 (NVMPI可用)");
+                    return Ok(EncoderType::Jetson);
+                }
+                println!("注意: Jetson平台未找到NVMPI编码器，使用CPU编码");
+                return Ok(EncoderType::Cpu);
+            }
             if check_nvenc_available()? {
                 println!("注意: 使用GPU编码 (NVENC可用)");
                 Ok(EncoderType::Gpu)

@@ -10,6 +10,19 @@ where
         "mp4", "mkv", "avi", "mov", "flv", "wmv", "webm", "m4v", "mpg", "mpeg", "3gp",
     ];
 
+    // If input is a single file, process it directly
+    if dir.is_file() {
+        let is_video = dir
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| video_extensions.contains(&ext.to_lowercase().as_str()))
+            .unwrap_or(false);
+        if is_video {
+            callback(dir.to_path_buf());
+        }
+        return;
+    }
+
     // Use min_depth(1) to avoid processing root directory itself
     let mut entries: Vec<_> = WalkDir::new(dir)
         .follow_links(true)

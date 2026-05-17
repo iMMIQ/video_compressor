@@ -76,6 +76,13 @@ pub fn process_video(
         return Ok(ProcessResult::Skipped("已是H.265编码".to_string()));
     }
 
+    // Jetson NVMPI HEVC encoder has minimum resolution requirements (~160x160).
+    // Below that, it enters an infinite error loop instead of failing cleanly.
+    // Fall back to CPU encoding for small-resolution videos.
+    let jetson_min_dim: u32 = 160;
+    let needs_cpu_fallback = encoder_config.encoder_type == EncoderType::Jetson
+        && (video_info.width < jetson_min_dim || video_info.height < jetson_min_dim);
+
     // Calculate preview duration: 10% of video, minimum 5 seconds
     // Jetson: cap at 10 seconds because CPU is slow
     let preview_duration = if duration > 0.0 {
@@ -100,7 +107,20 @@ pub fn process_video(
 
     // For Jetson: preview encoding uses CPU to get baseline bitrate
     // Then Jetson full encode uses target_bitrate = CPU_bitrate * 1.8
-    let (preview_config, jetson_target_bitrate) = if encoder_config.encoder_type == EncoderType::Jetson {
+    // If resolution is below Jetson minimum, entire pipeline falls back to CPU
+    let (preview_config, jetson_target_bitrate) = if needs_cpu_fallback {
+        let cpu_config = EncoderConfig {
+            encoder_type: EncoderType::Cpu,
+            preset: encoder_config.preset.clone(),
+            target_bitrate_kbps: None,
+            use_2pass: false,
+        };
+        println!(
+            "  注意: 分辨率 {}x{} 低于Jetson最小要求({}x{})，回退到CPU编码",
+            video_info.width, video_info.height, jetson_min_dim, jetson_min_dim
+        );
+        (cpu_config, false)
+    } else if encoder_config.encoder_type == EncoderType::Jetson {
         // Create CPU config for preview encoding
         let cpu_config = EncoderConfig {
             encoder_type: EncoderType::Cpu,
@@ -233,7 +253,20 @@ pub fn process_video(
     let temp_path = temp_file.path();
 
     // Execute full encode
-    let output_size = full_encode(input_path, temp_path, final_crf, &final_encoder_config, audio_bitrate, video_info.codec_name.as_deref(), video_info.pix_fmt.as_deref())?;
+    // If resolution below Jetson minimum, use CPU config instead
+    let cpu_fallback_config;
+    let effective_config = if needs_cpu_fallback {
+        cpu_fallback_config = EncoderConfig {
+            encoder_type: EncoderType::Cpu,
+            preset: encoder_config.preset.clone(),
+            target_bitrate_kbps: None,
+            use_2pass: false,
+        };
+        &cpu_fallback_config
+    } else {
+        &final_encoder_config
+    };
+    let output_size = full_encode(input_path, temp_path, final_crf, effective_config, audio_bitrate, video_info.codec_name.as_deref(), video_info.pix_fmt.as_deref())?;
 
     let actual_ratio = 1.0 - output_size as f64 / input_size as f64;
     println!(

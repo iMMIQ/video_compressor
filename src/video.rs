@@ -42,6 +42,8 @@ pub fn process_video(
     const MIN_PREVIEW_SECONDS: u32 = 5; // Minimum 5 seconds preview
     const JETSON_MAX_PREVIEW_SECONDS: u32 = 10; // Jetson CPU is slow, cap at 10s
 
+    println!("处理视频: {}", input_path.display());
+
     // Get input file metadata (for later restoration)
     let original_metadata =
         std::fs::metadata(input_path).context("无法读取输入文件元数据")?;
@@ -142,8 +144,6 @@ pub fn process_video(
         audio_bitrate,
         preview_duration,
         duration,
-        video_info.codec_name.as_deref(),
-        video_info.pix_fmt.as_deref(),
     )?;
 
     // For Jetson: calculate target bitrate from preview result
@@ -266,7 +266,7 @@ pub fn process_video(
     } else {
         &final_encoder_config
     };
-    let output_size = full_encode(input_path, temp_path, final_crf, effective_config, audio_bitrate, video_info.codec_name.as_deref(), video_info.pix_fmt.as_deref())?;
+    let output_size = full_encode(input_path, temp_path, final_crf, effective_config, audio_bitrate)?;
 
     let actual_ratio = 1.0 - output_size as f64 / input_size as f64;
     println!(

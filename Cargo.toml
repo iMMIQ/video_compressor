@@ -10,6 +10,10 @@ walkdir = "2.5"
 tempfile = "3.15"
 filetime = "0.2"
 crossbeam-channel = "0.5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "gif"] }
+kamadak-exif = "0.5"
+webp = "0.3"
+libwebp-sys = "0.9"
 
 [profile.release]
 opt-level = 3

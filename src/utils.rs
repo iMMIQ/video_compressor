@@ -25,6 +25,13 @@ pub fn get_output_path(input_path: &Path) -> PathBuf {
     parent.join(format!("{}.mp4", stem.to_string_lossy()))
 }
 
+/// Generate output path for image: same directory as input, with .webp extension
+pub fn get_image_output_path(input_path: &Path) -> PathBuf {
+    let stem = input_path.file_stem().unwrap_or(std::ffi::OsStr::new(""));
+    let parent = input_path.parent().unwrap_or(Path::new(""));
+    parent.join(format!("{}.webp", stem.to_string_lossy()))
+}
+
 /// Cross-filesystem safe file move
 /// Try rename first, fallback to copy+remove
 pub fn safe_move_file(from: &Path, to: &Path) -> Result<()> {

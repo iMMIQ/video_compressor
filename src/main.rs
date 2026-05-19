@@ -2,6 +2,7 @@ mod config;
 mod encoder;
 mod ffmpeg;
 mod gpu;
+mod image;
 mod scheduler;
 mod scanner;
 mod utils;
@@ -13,10 +14,11 @@ use config::{EncoderConfig, EncoderType};
 use crossbeam_channel::unbounded;
 use ffmpeg::check_ffmpeg;
 use scheduler::run_gpu_parallel;
+use scanner::scan_images_streaming;
 use scanner::scan_videos_streaming;
 use std::path::PathBuf;
 use std::thread;
-use utils::{format_size, get_output_path};
+use utils::{format_size, get_image_output_path, get_output_path};
 use video::{process_video, ConversionStats, ProcessResult};
 
 /// Video compression tool - recursively convert videos to H.265 format
@@ -59,6 +61,49 @@ struct Args {
     /// Force serial processing (disable GPU parallel encoding)
     #[arg(long, default_value = "false")]
     serial: bool,
+}
+
+fn process_images(input: &std::path::Path, results: &mut ConversionStats) {
+    println!("\n=== 图片转换 ===");
+    let (sender, receiver) = unbounded::<PathBuf>();
+
+    let input_clone = input.to_path_buf();
+    let scan_thread = thread::spawn(move || {
+        scan_images_streaming(&input_clone, |path| {
+            let _ = sender.send(path);
+        });
+    });
+
+    let mut count = 0;
+    while let Ok(image_path) = receiver.recv() {
+        count += 1;
+        println!("[{}] {}", count, image_path.display());
+
+        match image::process_image(&image_path) {
+            Ok(ProcessResult::Converted(stats)) => {
+                results.successful += 1;
+                results.total_input_size += stats.input_size;
+                results.total_output_size += stats.output_size;
+                println!(
+                    "  ✓ {} -> {} ({:.1}% 压缩)",
+                    format_size(stats.input_size),
+                    format_size(stats.output_size),
+                    (1.0 - stats.output_size as f64 / stats.input_size as f64) * 100.0
+                );
+            }
+            Ok(ProcessResult::Skipped(reason)) => {
+                results.skipped += 1;
+                println!("  - 跳过: {}", reason);
+            }
+            Err(e) => {
+                results.failed += 1;
+                println!("  ✗ 失败: {}", e);
+            }
+        }
+    }
+
+    scan_thread.join().ok();
+    println!("\n共处理 {} 个图片文件", count);
 }
 
 fn main() -> Result<()> {
@@ -109,6 +154,17 @@ fn main() -> Result<()> {
             println!("  -> (dry run) {}", output_path.display());
         });
         println!("\n共找到 {} 个视频文件", count);
+
+        // Scan images in dry run mode
+        println!("\n扫描图片中...\n");
+        let mut img_count = 0;
+        scan_images_streaming(&args.input, |path| {
+            img_count += 1;
+            println!("[{}] {}", img_count, path.display());
+            let output_path = get_image_output_path(&path);
+            println!("  -> (dry run) {}", output_path.display());
+        });
+        println!("\n共找到 {} 个图片文件", img_count);
     } else if matches!(encoder_config.encoder_type, EncoderType::Gpu | EncoderType::Jetson) && !args.serial {
         // GPU mode: use parallel scheduler (streaming scan)
         println!("开始流式扫描和处理...\n");
@@ -120,6 +176,9 @@ fn main() -> Result<()> {
             args.audio_bitrate,
             &mut results,
         )?;
+
+        // Process images after GPU video processing
+        process_images(&args.input, &mut results);
     } else {
         // CPU mode or GPU serial mode: streaming sequential processing
         println!("开始流式扫描和处理...\n");
@@ -169,6 +228,9 @@ fn main() -> Result<()> {
         }
 
         scan_thread.join().ok();
+
+        // Process images after CPU video processing
+        process_images(&args.input, &mut results);
     }
 
     // Output statistics

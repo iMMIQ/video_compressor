@@ -103,8 +103,6 @@ fn inject_exif_into_webp(webp_data: &[u8], exif_data: &[u8]) -> Vec<u8> {
 }
 
 pub fn process_image(input_path: &Path) -> Result<ProcessResult> {
-    println!("处理图片: {}", input_path.display());
-
     // Read original file metadata
     let original_metadata =
         std::fs::metadata(input_path).context("无法读取输入文件元数据")?;
@@ -144,13 +142,6 @@ pub fn process_image(input_path: &Path) -> Result<ProcessResult> {
     }
 
     let output_size = webp_data.len() as u64;
-
-    println!(
-        "  {} -> {} ({:.1}%)",
-        format_size(input_size),
-        format_size(output_size),
-        (1.0 - output_size as f64 / input_size as f64) * 100.0
-    );
 
     // Skip if output is larger or equal
     if output_size >= input_size {

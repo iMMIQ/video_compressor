@@ -65,21 +65,49 @@ struct Args {
 
 fn process_images(input: &std::path::Path, results: &mut ConversionStats) {
     println!("\n=== 图片转换 ===");
-    let (sender, receiver) = unbounded::<PathBuf>();
 
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    println!("使用 {} 个线程并行处理", num_workers);
+
+    let (work_sender, work_receiver) = unbounded::<PathBuf>();
+    let (result_sender, result_receiver) = unbounded::<(PathBuf, anyhow::Result<ProcessResult>)>();
+
+    // Spawn worker threads
+    let workers: Vec<_> = (0..num_workers)
+        .map(|_| {
+            let rx = work_receiver.clone();
+            let tx = result_sender.clone();
+            thread::spawn(move || {
+                while let Ok(path) = rx.recv() {
+                    let result = image::process_image(&path);
+                    let _ = tx.send((path, result));
+                }
+            })
+        })
+        .collect();
+
+    // Drop main-thread-owned clones so channels close properly
+    drop(work_receiver);
+    drop(result_sender);
+
+    // Scanner thread: discovers image files and sends paths to workers
     let input_clone = input.to_path_buf();
-    let scan_thread = thread::spawn(move || {
+    let scan_handle = thread::spawn(move || {
         scan_images_streaming(&input_clone, |path| {
-            let _ = sender.send(path);
+            let _ = work_sender.send(path);
         });
     });
 
+    // Collect results in completion order
     let mut count = 0;
-    while let Ok(image_path) = receiver.recv() {
+    while let Ok((image_path, process_result)) = result_receiver.recv() {
         count += 1;
         println!("[{}] {}", count, image_path.display());
 
-        match image::process_image(&image_path) {
+        match process_result {
             Ok(ProcessResult::Converted(stats)) => {
                 results.successful += 1;
                 results.total_input_size += stats.input_size;
@@ -102,7 +130,10 @@ fn process_images(input: &std::path::Path, results: &mut ConversionStats) {
         }
     }
 
-    scan_thread.join().ok();
+    scan_handle.join().ok();
+    for worker in workers {
+        worker.join().ok();
+    }
     println!("\n共处理 {} 个图片文件", count);
 }
 

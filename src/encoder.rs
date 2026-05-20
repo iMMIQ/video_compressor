@@ -58,7 +58,7 @@ pub fn build_encode_args(crf: u8, preset: &str, config: &EncoderConfig) -> Vec<S
         EncoderType::Jetson => {
             // Jetson NVMPI does not support -qp parameter (it's ignored!)
             // Must use -b:v bitrate control instead
-            let target_bitrate_kbps = config.target_bitrate_kbps.unwrap_or_else(|| {
+            let target_bitrate_kbps = config.target_bitrate_kbps.unwrap_or({
                 // Fallback: CRF to bitrate mapping (approximate)
                 match crf {
                     18..=22 => 1500, // High quality

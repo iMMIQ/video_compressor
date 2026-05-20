@@ -168,8 +168,7 @@ impl ConcurrencyController {
         }
 
         // Gain per additional task
-        let gain = curr_util.saturating_sub(prev_util);
-        gain
+        curr_util.saturating_sub(prev_util)
     }
 
     pub fn current_max(&self) -> usize {

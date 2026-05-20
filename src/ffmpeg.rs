@@ -13,6 +13,7 @@ pub struct VideoInfo {
     pub duration: f64,
     #[allow(dead_code)]
     pub bitrate: u64,
+    #[allow(dead_code)]
     pub pix_fmt: Option<String>,
 }
 
@@ -119,7 +120,7 @@ pub fn get_video_info(path: &Path) -> Result<VideoInfo> {
     let info = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = info.lines().collect();
 
-    let codec_name = lines.get(0).map(|s| s.to_string());
+    let codec_name = lines.first().map(|s| s.to_string());
     let width = lines.get(1).and_then(|s| s.parse().ok()).unwrap_or(1920);
     let height = lines.get(2).and_then(|s| s.parse().ok()).unwrap_or(1080);
     let pix_fmt = lines.get(3).filter(|s| !s.is_empty()).map(|s| s.to_string());
@@ -139,10 +140,10 @@ pub fn get_video_info(path: &Path) -> Result<VideoInfo> {
 /// Check if running on Jetson (Tegra) platform
 fn is_jetson_platform() -> bool {
     // Check kernel release for "tegra" suffix
-    if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
-        if release.contains("tegra") {
-            return true;
-        }
+    if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        && release.contains("tegra")
+    {
+        return true;
     }
     // Check Jetson GPU sysfs path
     std::path::Path::new("/sys/devices/platform/17000000.gpu/load").exists()

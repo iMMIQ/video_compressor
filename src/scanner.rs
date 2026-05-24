@@ -1,50 +1,77 @@
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "3g2",
+    "3gp",
+    "asf",
+    "avi",
+    "divx",
+    "f4v",
+    "flv",
+    "m2ts",
+    "m4v",
+    "mkv",
+    "mov",
+    "mp4",
+    "mp4v",
+    "mpe",
+    "mpeg",
+    "mpg",
+    "mts",
+    "ogv",
+    "rm",
+    "rmvb",
+    "tp",
+    "trp",
+    "ts",
+    "vob",
+    "webm",
+    "wmv",
+];
+
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "bmp",
+    "gif",
+    "heic",
+    "heif",
+    "jpg",
+    "jpeg",
+    "png",
+    "tiff",
+    "tif",
+    "webp",
+];
+
+#[inline]
+fn matches_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| extensions.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// Stream scan video files (callback-based for memory efficiency)
 pub fn scan_videos_streaming<F>(dir: &Path, mut callback: F)
 where
     F: FnMut(PathBuf),
 {
-    let video_extensions = [
-        "mp4", "mkv", "avi", "mov", "flv", "wmv", "webm", "m4v", "mpg", "mpeg", "3gp",
-    ];
-
-    // If input is a single file, process it directly
     if dir.is_file() {
-        let is_video = dir
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| video_extensions.contains(&ext.to_lowercase().as_str()))
-            .unwrap_or(false);
-        if is_video {
+        if matches_extension(dir, VIDEO_EXTENSIONS) {
             callback(dir.to_path_buf());
         }
         return;
     }
 
-    // Use min_depth(1) to avoid processing root directory itself
-    let mut entries: Vec<_> = WalkDir::new(dir)
+    for entry in WalkDir::new(dir)
         .follow_links(true)
         .min_depth(1)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| video_extensions.contains(&ext.to_lowercase().as_str()))
-                .unwrap_or(false)
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
-
-    // Sort for consistent processing order
-    entries.sort();
-
-    for path in entries {
-        callback(path);
+        .filter(|e| matches_extension(e.path(), VIDEO_EXTENSIONS))
+    {
+        callback(entry.path().to_path_buf());
     }
 }
 
@@ -53,40 +80,21 @@ pub fn scan_images_streaming<F>(dir: &Path, mut callback: F)
 where
     F: FnMut(PathBuf),
 {
-    let image_extensions = ["jpg", "jpeg", "png", "bmp", "tiff", "tif", "gif"];
-
-    // If input is a single file, process it directly
     if dir.is_file() {
-        let is_image = dir
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| image_extensions.contains(&ext.to_lowercase().as_str()))
-            .unwrap_or(false);
-        if is_image {
+        if matches_extension(dir, IMAGE_EXTENSIONS) {
             callback(dir.to_path_buf());
         }
         return;
     }
 
-    let mut entries: Vec<_> = WalkDir::new(dir)
+    for entry in WalkDir::new(dir)
         .follow_links(true)
         .min_depth(1)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| image_extensions.contains(&ext.to_lowercase().as_str()))
-                .unwrap_or(false)
-        })
-        .map(|e| e.path().to_path_buf())
-        .collect();
-
-    entries.sort();
-
-    for path in entries {
-        callback(path);
+        .filter(|e| matches_extension(e.path(), IMAGE_EXTENSIONS))
+    {
+        callback(entry.path().to_path_buf());
     }
 }

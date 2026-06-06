@@ -207,7 +207,7 @@ pub fn preview_encode(
         // Extract five raw segments to temp files
         let temp_segs: Vec<NamedTempFile> = (0..NUM_SEGMENTS)
             .map(|i| {
-                NamedTempFile::with_suffix(".mp4").context(format!("无法创建临时文件{}", i + 1))
+                NamedTempFile::with_suffix(".mkv").context(format!("无法创建临时文件{}", i + 1))
             })
             .collect::<Result<Vec<_>>>()?;
 

@@ -196,7 +196,7 @@ fn main() -> Result<()> {
             println!("  -> (dry run) {}", output_path.display());
         });
         println!("\n共找到 {} 个图片文件", img_count);
-    } else if matches!(encoder_config.encoder_type, EncoderType::Gpu | EncoderType::Jetson) && !args.serial {
+    } else if matches!(encoder_config.encoder_type, EncoderType::Gpu) && !args.serial {
         // GPU mode: use parallel scheduler (streaming scan)
         println!("开始流式扫描和处理...\n");
         run_gpu_parallel(

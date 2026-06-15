@@ -9,6 +9,7 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "divx",
     "f4v",
     "flv",
+    "gif",
     "m2ts",
     "m4v",
     "mkv",
@@ -32,7 +33,6 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "bmp",
-    "gif",
     "heic",
     "heif",
     "jpg",

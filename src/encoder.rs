@@ -317,6 +317,7 @@ pub fn full_encode(
     crf: u8,
     encoder_config: &EncoderConfig,
     audio_bitrate: u32,
+    pix_fmt: Option<&str>,
 ) -> Result<u64> {
     let decode_args = build_decode_args(encoder_config);
     let video_args = build_encode_args(crf, &encoder_config.preset, encoder_config);
@@ -328,6 +329,9 @@ pub fn full_encode(
     cmd.arg("-i").arg(input_path);
     for arg in video_args {
         cmd.arg(arg);
+    }
+    if let Some(fmt) = pix_fmt {
+        cmd.arg("-pix_fmt").arg(fmt);
     }
 
     // Audio processing

@@ -47,9 +47,6 @@ pub fn process_video(
     // Get input file metadata (for later restoration)
     let original_metadata =
         std::fs::metadata(input_path).context("无法读取输入文件元数据")?;
-    let original_atime = FileTime::from_last_access_time(&original_metadata);
-    let original_mtime = FileTime::from_last_modification_time(&original_metadata);
-    let original_permissions = original_metadata.permissions();
 
     // Get input file size
     let input_size = original_metadata.len();
@@ -76,6 +73,48 @@ pub fn process_video(
     // Already HEVC, skip
     if is_hevc {
         return Ok(ProcessResult::Skipped("已是H.265编码".to_string()));
+    }
+
+    // GIF: treat as a short video, always encode with CPU at fixed CRF=23.
+    // Skip preview/extrapolation and never use hardware encoders (animated GIF
+    // frame layouts and palette decode poorly through NVENC/NVMPI).
+    let is_gif = input_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("gif"))
+        .unwrap_or(false);
+
+    if is_gif {
+        println!("  (GIF: 强制CPU编码, CRF=23)");
+        let gif_config = EncoderConfig {
+            encoder_type: EncoderType::Cpu,
+            preset: encoder_config.preset.clone(),
+            target_bitrate_kbps: None,
+            use_2pass: false,
+        };
+
+        let output_size = finalize_encode(
+            input_path,
+            PREVIEW_CRF,
+            &gif_config,
+            audio_bitrate,
+            Some("yuv420p"),
+            &original_metadata,
+        )?;
+
+        let actual_ratio = 1.0 - output_size as f64 / input_size as f64;
+        println!(
+            "  实际压缩: {} -> {} ({:.1}%)",
+            format_size(input_size),
+            format_size(output_size),
+            actual_ratio * 100.0
+        );
+
+        return Ok(ProcessResult::Converted(FileStats {
+            input_size,
+            output_size,
+            used_crf: PREVIEW_CRF,
+        }));
     }
 
     // Jetson NVMPI HEVC encoder has minimum resolution requirements (~160x160).
@@ -248,11 +287,6 @@ pub fn process_video(
 
     println!("  使用 CRF={} 进行完整编码...", final_crf);
 
-    // Create temp file for encoding
-    let temp_file = NamedTempFile::with_suffix(".mp4").context("无法创建临时文件")?;
-    let temp_path = temp_file.path();
-
-    // Execute full encode
     // If resolution below Jetson minimum, use CPU config instead
     let cpu_fallback_config;
     let effective_config = if needs_cpu_fallback {
@@ -266,7 +300,15 @@ pub fn process_video(
     } else {
         &final_encoder_config
     };
-    let output_size = full_encode(input_path, temp_path, final_crf, effective_config, audio_bitrate)?;
+
+    let output_size = finalize_encode(
+        input_path,
+        final_crf,
+        effective_config,
+        audio_bitrate,
+        None,
+        &original_metadata,
+    )?;
 
     let actual_ratio = 1.0 - output_size as f64 / input_size as f64;
     println!(
@@ -275,6 +317,33 @@ pub fn process_video(
         format_size(output_size),
         actual_ratio * 100.0
     );
+
+    Ok(ProcessResult::Converted(FileStats {
+        input_size,
+        output_size,
+        used_crf: final_crf,
+    }))
+}
+
+/// Encode into a temp MP4, atomically replace the original file, and restore
+/// the original access/modification times and permissions. Returns output size.
+fn finalize_encode(
+    input_path: &Path,
+    final_crf: u8,
+    config: &EncoderConfig,
+    audio_bitrate: u32,
+    pix_fmt: Option<&str>,
+    original_metadata: &std::fs::Metadata,
+) -> Result<u64> {
+    let original_atime = FileTime::from_last_access_time(original_metadata);
+    let original_mtime = FileTime::from_last_modification_time(original_metadata);
+    let original_permissions = original_metadata.permissions();
+
+    // Create temp file for encoding
+    let temp_file = NamedTempFile::with_suffix(".mp4").context("无法创建临时文件")?;
+    let temp_path = temp_file.path();
+
+    let output_size = full_encode(input_path, temp_path, final_crf, config, audio_bitrate, pix_fmt)?;
 
     // Generate final output path
     let output_path = get_output_path(input_path);
@@ -294,9 +363,5 @@ pub fn process_video(
     // Consume temp_file to avoid deletion
     let _ = temp_file;
 
-    Ok(ProcessResult::Converted(FileStats {
-        input_size,
-        output_size,
-        used_crf: final_crf,
-    }))
+    Ok(output_size)
 }

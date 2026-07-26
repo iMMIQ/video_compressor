@@ -9,7 +9,6 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "divx",
     "f4v",
     "flv",
-    "gif",
     "m2ts",
     "m4v",
     "mkv",
@@ -31,8 +30,16 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "wmv",
 ];
 
+// NOTE: "webp" is intentionally NOT included. Existing WebP files (including
+// animated ugoira webp) are left untouched — re-encoding them would destroy
+// animations and/or needlessly degrade already-compressed images.
+// "gif" is included: GIFs are treated as images (converted to single-frame
+// WebP). The image path guards against animated GIFs (skips them rather than
+// flattening to frame 0), and was previously misrouted to the ffmpeg video
+// path where it always failed.
 const IMAGE_EXTENSIONS: &[&str] = &[
     "bmp",
+    "gif",
     "heic",
     "heif",
     "jpg",
@@ -40,7 +47,6 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "png",
     "tiff",
     "tif",
-    "webp",
 ];
 
 #[inline]

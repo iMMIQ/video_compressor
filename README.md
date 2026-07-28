@@ -94,6 +94,12 @@ make build   # 标准构建
 
 # 仅扫描不转换
 ./video_compressor -i /path/to/videos --dry-run
+
+# 一次性检测旧版本生成的 EXIF-first 错误 WebP
+./video_compressor -i /path/to/pictures --repair-webp --dry-run
+
+# 原位修复错误 WebP；保留 EXIF、inode、权限、所有者、atime 和 mtime
+./video_compressor -i /path/to/pictures --repair-webp
 ```
 
 ## 智能压缩算法
@@ -131,6 +137,7 @@ make build   # 标准构建
 | `-j, --jobs` | 并发任务数 | 1 |
 | `--serial` | 强制串行处理 | false |
 | `--dry-run` | 仅扫描不执行 | false |
+| `--repair-webp` | 修复旧版本生成的 EXIF-first WebP 后退出 | false |
 
 ### CRF 参考值
 

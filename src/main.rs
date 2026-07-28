@@ -7,6 +7,7 @@ mod scheduler;
 mod scanner;
 mod utils;
 mod video;
+mod webp_mux;
 
 use anyhow::Result;
 use clap::Parser;
@@ -15,7 +16,7 @@ use crossbeam_channel::unbounded;
 use ffmpeg::check_ffmpeg;
 use scheduler::run_gpu_parallel;
 use scanner::scan_images_streaming;
-use scanner::scan_videos_streaming;
+use scanner::{scan_videos_streaming, scan_webp_streaming};
 use std::path::PathBuf;
 use std::thread;
 use utils::{format_size, get_image_output_path, get_output_path};
@@ -61,6 +62,10 @@ struct Args {
     /// Force serial processing (disable GPU parallel encoding)
     #[arg(long, default_value = "false")]
     serial: bool,
+
+    /// Repair WebP files produced by the old EXIF-first writer, then exit
+    #[arg(long, default_value = "false")]
+    repair_webp: bool,
 }
 
 /// Cap on image-processing concurrency. Workers are I/O-bound on NFS (half
@@ -69,6 +74,56 @@ struct Args {
 /// sweet spot: roughly doubles throughput vs 4, while peak RAM stays modest
 /// (each worker decodes one image into RAM; 8 × ~30MB typical ≪ headroom).
 const MAX_IMAGE_WORKERS: usize = 8;
+
+fn repair_webp_files(input: &std::path::Path, dry_run: bool) -> Result<()> {
+    println!("WebP 容器恢复模式");
+    println!("输入路径: {}", input.display());
+    println!("执行方式: {}", if dry_run { "仅检测" } else { "原位修复" });
+
+    let mut scanned = 0usize;
+    let mut affected = 0usize;
+    let mut failed = 0usize;
+    scan_webp_streaming(input, |path| {
+        scanned += 1;
+        match webp_mux::repair_file(&path, dry_run) {
+            Ok(webp_mux::RepairResult::NotAffected) => {}
+            Ok(webp_mux::RepairResult::WouldRepair { old_size, new_size }) => {
+                affected += 1;
+                println!(
+                    "[待修复] {} ({} -> {})",
+                    path.display(),
+                    format_size(old_size),
+                    format_size(new_size)
+                );
+            }
+            Ok(webp_mux::RepairResult::Repaired { old_size, new_size }) => {
+                affected += 1;
+                println!(
+                    "[已修复] {} ({} -> {})",
+                    path.display(),
+                    format_size(old_size),
+                    format_size(new_size)
+                );
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!("[失败] {}: {:#}", path.display(), error);
+            }
+        }
+    });
+
+    println!(
+        "扫描完成: {} 个 WebP，{} {}，{} 个失败",
+        scanned,
+        affected,
+        if dry_run { "个待修复" } else { "个已修复" },
+        failed
+    );
+    if failed > 0 {
+        anyhow::bail!("有 {} 个 WebP 修复失败", failed);
+    }
+    Ok(())
+}
 
 fn process_images(input: &std::path::Path, results: &mut ConversionStats) {
     println!("\n=== 图片转换 ===");
@@ -151,6 +206,10 @@ fn main() -> Result<()> {
     // Validate input directory
     if !args.input.exists() {
         anyhow::bail!("输入目录不存在: {}", args.input.display());
+    }
+
+    if args.repair_webp {
+        return repair_webp_files(&args.input, args.dry_run);
     }
 
     // Parse and resolve encoder type

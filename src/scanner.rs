@@ -49,6 +49,8 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "tif",
 ];
 
+const WEBP_EXTENSIONS: &[&str] = &["webp"];
+
 #[inline]
 fn matches_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
@@ -100,6 +102,33 @@ where
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
         .filter(|e| matches_extension(e.path(), IMAGE_EXTENSIONS))
+    {
+        callback(entry.path().to_path_buf());
+    }
+}
+
+/// Stream scan WebP files for the one-time container repair mode.
+pub fn scan_webp_streaming<F>(dir: &Path, mut callback: F)
+where
+    F: FnMut(PathBuf),
+{
+    if dir.is_file() {
+        if matches_extension(dir, WEBP_EXTENSIONS) {
+            callback(dir.to_path_buf());
+        }
+        return;
+    }
+
+    for entry in WalkDir::new(dir)
+        .follow_links(true)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| matches_extension(e.path(), WEBP_EXTENSIONS))
+        // WalkDir already has the directory-entry type. Calling path().is_file()
+        // here would issue an extra GETATTR for every item on NFS, including
+        // millions of non-WebP files.
+        .filter(|e| e.file_type().is_file())
     {
         callback(entry.path().to_path_buf());
     }

@@ -1,5 +1,6 @@
 use crate::utils::{format_size, get_image_output_path};
 use crate::video::{FileStats, ProcessResult};
+use crate::webp_mux;
 use anyhow::{Context, Result};
 use filetime::{set_file_times, FileTime};
 use std::io::Write;
@@ -58,43 +59,6 @@ fn extract_raw_exif(data: &[u8]) -> Option<Vec<u8>> {
     }
 
     None
-}
-
-/// Inject EXIF data into a WebP file's RIFF container
-fn inject_exif_into_webp(webp_data: &[u8], exif_data: &[u8]) -> Vec<u8> {
-    // WebP RIFF structure:
-    //   RIFF <file_size:u32LE> WEBP <chunks...>
-    // Each chunk: <fourcc:4bytes> <chunk_size:u32LE> <data...> [padding]
-    if webp_data.len() < 12 || &webp_data[0..4] != b"RIFF" || &webp_data[8..12] != b"WEBP" {
-        return webp_data.to_vec();
-    }
-
-    // Build EXIF chunk: "EXIF" + size (LE) + data (padded to even)
-    let exif_chunk_data = exif_data;
-    let exif_chunk_size = exif_chunk_data.len() as u32;
-    let padding = if exif_chunk_data.len() % 2 == 1 {
-        vec![0u8]
-    } else {
-        vec![]
-    };
-
-    let mut exif_chunk = Vec::with_capacity(8 + exif_chunk_data.len() + padding.len());
-    exif_chunk.extend_from_slice(b"EXIF");
-    exif_chunk.extend_from_slice(&exif_chunk_size.to_le_bytes());
-    exif_chunk.extend_from_slice(exif_chunk_data);
-    exif_chunk.extend_from_slice(&padding);
-
-    // Insert EXIF chunk after the WEBP header (at offset 12), before VP8/VP8L chunk
-    let mut result = Vec::with_capacity(webp_data.len() + exif_chunk.len());
-    result.extend_from_slice(&webp_data[..12]); // "RIFF" + size + "WEBP"
-    result.extend_from_slice(&exif_chunk);
-    result.extend_from_slice(&webp_data[12..]);
-
-    // Update RIFF file size
-    let new_size = (result.len() - 8) as u32;
-    result[4..8].copy_from_slice(&new_size.to_le_bytes());
-
-    result
 }
 
 /// Whether the path is a GIF (case-insensitive extension).
@@ -190,7 +154,7 @@ pub fn process_image(input_path: &Path) -> Result<ProcessResult> {
 
     // Inject EXIF metadata if present
     if let Some(exif) = raw_exif {
-        webp_data = inject_exif_into_webp(&webp_data, &exif);
+        webp_data = webp_mux::add_exif(&webp_data, &exif)?;
     }
 
     let output_size = webp_data.len() as u64;

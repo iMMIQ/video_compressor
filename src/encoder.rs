@@ -8,6 +8,36 @@ pub struct PreviewResult {
     pub output_size_per_second: f64, // Bytes per second after preview encoding
 }
 
+/// A `-c copy` segment is only usable if it actually contains a video stream.
+/// ASF/WMV input seeking can land where no keyframe arrives within the
+/// requested window; ffmpeg then writes an empty segment while still exiting 0.
+fn segment_has_video(path: &Path) -> bool {
+    Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("stream=codec_type")
+        .arg("-of")
+        .arg("csv=p=0")
+        .arg(path)
+        .output()
+        .map(|o| {
+            o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+        })
+        .unwrap_or(false)
+}
+
+/// Tail of ffmpeg's stderr for error reporting (full stderr is huge progress noise)
+fn stderr_tail(output: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr);
+    let tail: Vec<&str> = text.lines().rev().take(15).collect();
+    let mut lines = tail;
+    lines.reverse();
+    lines.join("\n")
+}
+
 /// Build hardware decode arguments for FFmpeg
 pub fn build_decode_args(config: &EncoderConfig) -> Vec<String> {
     match config.encoder_type {
@@ -167,13 +197,11 @@ pub fn preview_encode(
         encode_cmd.arg(temp_output_path);
 
         let output = encode_cmd
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
             .output()
             .context("执行FFmpeg预览编码失败")?;
 
         if !output.status.success() {
-            anyhow::bail!("预览编码失败");
+            anyhow::bail!("预览编码失败: {}", stderr_tail(&output));
         }
 
         drop(_keep);
@@ -211,7 +239,7 @@ pub fn preview_encode(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Extract each segment
+        // Extract each segment (stream copy: fast, but keyframe-aligned)
         let mut extract_success = true;
         for (i, temp_seg) in temp_segs.iter().enumerate() {
             let extract = Command::new("ffmpeg")
@@ -230,9 +258,56 @@ pub fn preview_encode(
                 .output()
                 .context(format!("提取片段{}失败", i + 1))?;
 
-            if !extract.status.success() {
+            if !extract.status.success() || !segment_has_video(temp_seg.path()) {
                 extract_success = false;
                 break;
+            }
+        }
+
+        if !extract_success {
+            // Sparse-keyframe sources (e.g. WMV2/ASF where the seek point
+            // yields no keyframe in the window) produce empty copy segments.
+            // Retry the whole set with decode+re-encode using OUTPUT-side seek
+            // (`-ss` after `-i`): input-side seek trusts the container index,
+            // which is broken on some ASF files (packet timestamps N/A).
+            // Slower — every segment decodes from 0 — but frame accurate, and
+            // all segments share one codec for the concat.
+            println!("    (copy分段为空，改用解码重编码提取)");
+            extract_success = true;
+            for (i, temp_seg) in temp_segs.iter().enumerate() {
+                let mut cmd = Command::new("ffmpeg");
+                cmd.arg("-y")
+                    .arg("-i")
+                    .arg(input_path)
+                    .arg("-ss")
+                    .arg(format!("{:.1}", seg_starts[i]))
+                    .arg("-t")
+                    .arg(seg_durs[i].to_string())
+                    .arg("-c:v")
+                    .arg("libx264")
+                    .arg("-preset")
+                    .arg("ultrafast")
+                    .arg("-crf")
+                    .arg("18");
+                if audio_bitrate > 0 {
+                    cmd.arg("-c:a")
+                        .arg("aac")
+                        .arg("-b:a")
+                        .arg(format!("{}k", audio_bitrate));
+                } else {
+                    cmd.arg("-c:a").arg("copy");
+                }
+                let extract = cmd
+                    .arg(temp_seg.path())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .context(format!("提取片段{}失败(重编码)", i + 1))?;
+
+                if !extract.status.success() || !segment_has_video(temp_seg.path()) {
+                    extract_success = false;
+                    break;
+                }
             }
         }
 
@@ -283,8 +358,6 @@ pub fn preview_encode(
         encode_cmd.arg(temp_output_path);
 
         let output = encode_cmd
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
             .output()
             .context("执行FFmpeg预览编码失败")?;
 
@@ -292,7 +365,7 @@ pub fn preview_encode(
         drop(temp_segs);
 
         if !output.status.success() {
-            anyhow::bail!("预览编码失败");
+            anyhow::bail!("预览编码失败: {}", stderr_tail(&output));
         }
     }
 

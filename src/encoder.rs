@@ -301,10 +301,18 @@ pub fn preview_encode(
         .context("无法读取预览输出文件")?
         .len() as f64;
 
+    // `-c copy` segment extraction snaps to keyframes, so sparse-GOP sources
+    // (WMV/VC-1, RMVB, ...) yield segments far longer than requested — 3x for
+    // old WMVs, which inflated the bitrate estimate and pushed the extrapolated
+    // CRF past the limit (files were skipped as "uncompressible"). Divide by
+    // the encoded output's real duration instead of the requested one.
+    let actual_duration =
+        crate::ffmpeg::probe_duration(temp_output_path).unwrap_or(duration as f64);
+
     drop(temp_output);
 
     // Return bytes per second for proportional estimation
-    let output_size_per_second = output_size / duration as f64;
+    let output_size_per_second = output_size / actual_duration;
 
     Ok(PreviewResult {
         output_size_per_second,

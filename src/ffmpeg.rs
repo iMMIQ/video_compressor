@@ -137,6 +137,28 @@ pub fn get_video_info(path: &Path) -> Result<VideoInfo> {
     })
 }
 
+/// Probe the real duration (seconds) of a media file via ffprobe.
+/// Returns None if ffprobe fails or reports no usable duration.
+pub fn probe_duration(path: &Path) -> Option<f64> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=nokey=1:noprint_wrappers=1")
+        .arg(path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().parse::<f64>().ok().filter(|d| *d > 0.0)
+}
+
 /// Check if running on Jetson (Tegra) platform
 fn is_jetson_platform() -> bool {
     // Check kernel release for "tegra" suffix

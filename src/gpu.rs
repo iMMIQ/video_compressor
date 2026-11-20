@@ -1,15 +1,15 @@
-use crate::config::{EncoderConfig, EncoderType};
-use crate::encoder::preview_encode;
+use crate::config::EncoderType;
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::fs;
-use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const MIN_CONCURRENT: usize = 1;
-const MAX_CONCURRENT: usize = 8;
+pub const MIN_CONCURRENT: usize = 1;
+pub const DEFAULT_MAX_CONCURRENT: usize = 8;
 const MARGINAL_GAIN_THRESHOLD: u8 = 5;
-const UTILIZATION_HIGH: u8 = 95;
+const UTILIZATION_HIGH: u8 = 90;
+const MAX_HISTORY_LEN: usize = 64;
 
 /// Jetson GPU load sysfs paths (tried in order)
 const JETSON_GPU_LOAD_PATHS: &[&str] = &[
@@ -35,7 +35,7 @@ impl GpuMonitor {
         }
     }
 
-    /// Get GPU utilization (with cache)
+    /// Get GPU encoder utilization (with 2s cache).
     pub fn get_utilization(&mut self) -> Result<u8> {
         if self.last_check.elapsed() < self.cache_duration {
             return Ok(self.cached_utilization);
@@ -52,23 +52,25 @@ impl GpuMonitor {
         Ok(util)
     }
 
-    /// Read GPU load from Jetson sysfs (value 0-1000, maps to 0-100%)
+    /// Read GPU load from Jetson sysfs (value 0-1000, maps to 0-100%).
     fn read_jetson_gpu_load(&self) -> Result<u8> {
         for path in JETSON_GPU_LOAD_PATHS {
             if let Ok(content) = fs::read_to_string(path) {
                 let val: u32 = content.trim().parse().unwrap_or(0);
-                // sysfs load is 0-1000 (permille), convert to 0-100
                 return Ok((val / 10).min(100) as u8);
             }
         }
-        // Fallback: if sysfs not readable, return 50% as safe default
         Ok(50)
     }
 
-    /// Read GPU load from nvidia-smi (desktop GPUs)
+    /// Read NVENC encoder utilization from nvidia-smi, falling back to GPU utilization
+    /// if the driver reports `[N/A]` for encoder utilization.
     fn read_nvidia_smi_load(&self) -> Result<u8> {
         let output = Command::new("nvidia-smi")
-            .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+            .args([
+                "--query-gpu=utilization.encoder,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ])
             .output()
             .context("无法执行 nvidia-smi")?;
 
@@ -77,14 +79,21 @@ impl GpuMonitor {
         }
 
         let util_str = String::from_utf8_lossy(&output.stdout);
-        Ok(util_str.trim().parse::<u8>().unwrap_or(0))
+        Ok(parse_nvidia_smi_utilization(&util_str))
     }
+}
 
-    /// Force refresh cache and get latest value
-    pub fn force_refresh(&mut self) -> Result<u8> {
-        self.last_check = Instant::now() - Duration::from_secs(10);
-        self.get_utilization()
-    }
+/// Parse `nvidia-smi --query-gpu=utilization.encoder,utilization.gpu --format=csv,noheader,nounits`.
+/// Prefers encoder utilization; falls back to GPU utilization when encoder metric is unavailable.
+pub fn parse_nvidia_smi_utilization(stdout: &str) -> u8 {
+    let Some(first_line) = stdout.lines().find(|l| !l.trim().is_empty()) else {
+        return 0;
+    };
+    let mut parts = first_line.split(',').map(|s| s.trim());
+    let enc_util = parts.next().and_then(|s| s.parse::<u8>().ok());
+    let gpu_util = parts.next().and_then(|s| s.parse::<u8>().ok());
+
+    enc_util.or(gpu_util).unwrap_or(0).min(100)
 }
 
 /// Concurrency adjustment action
@@ -95,47 +104,49 @@ pub enum ConcurrencyAction {
     Maintain,
 }
 
-/// Concurrency controller
+/// Dynamic concurrency controller with bounded history.
 pub struct ConcurrencyController {
     current_max: usize,
-    history: Vec<(usize, u8)>, // (concurrent jobs, GPU utilization)
+    max_limit: usize,
+    history: VecDeque<(usize, u8)>, // (concurrent jobs, utilization)
 }
 
 impl ConcurrencyController {
-    pub fn new(initial: usize) -> Self {
+    pub fn new(initial: usize, max_limit: usize) -> Self {
+        let clamped_limit = max_limit.max(MIN_CONCURRENT);
         Self {
-            current_max: initial.clamp(MIN_CONCURRENT, MAX_CONCURRENT),
-            history: Vec::new(),
+            current_max: initial.clamp(MIN_CONCURRENT, clamped_limit),
+            max_limit: clamped_limit,
+            history: VecDeque::with_capacity(MAX_HISTORY_LEN),
         }
     }
 
-    /// Decide next action based on current GPU utilization
-    pub fn decide(&mut self, current_gpu_util: u8, current_running: usize) -> ConcurrencyAction {
-        self.history.push((current_running, current_gpu_util));
+    /// Decide next action based on current encoder utilization and running count.
+    pub fn decide(&mut self, current_util: u8, current_running: usize) -> ConcurrencyAction {
+        if self.history.len() == MAX_HISTORY_LEN {
+            self.history.pop_front();
+        }
+        self.history.push_back((current_running, current_util));
 
-        // If running tasks haven't reached current max, fill up first
+        // Wait until running tasks fill current_max before scaling up/down.
         if current_running < self.current_max {
             return ConcurrencyAction::Maintain;
         }
 
-        // GPU overloaded, reduce concurrency
-        if current_gpu_util > UTILIZATION_HIGH {
+        if current_util > UTILIZATION_HIGH {
             if self.current_max > MIN_CONCURRENT {
                 self.current_max -= 1;
+                return ConcurrencyAction::Decrease;
             }
-            return ConcurrencyAction::Decrease;
-        }
-
-        // Calculate marginal gain
-        let marginal_gain = self.calculate_marginal_gain();
-
-        if marginal_gain < MARGINAL_GAIN_THRESHOLD {
-            // Marginal gain too small, maintain status quo
             return ConcurrencyAction::Maintain;
         }
 
-        // Still room for improvement, try increasing
-        if self.current_max < MAX_CONCURRENT {
+        let marginal_gain = self.calculate_marginal_gain();
+        if marginal_gain < MARGINAL_GAIN_THRESHOLD {
+            return ConcurrencyAction::Maintain;
+        }
+
+        if self.current_max < self.max_limit {
             self.current_max += 1;
             return ConcurrencyAction::Increase;
         }
@@ -143,73 +154,74 @@ impl ConcurrencyController {
         ConcurrencyAction::Maintain
     }
 
-    /// Calculate marginal gain from last two records
     fn calculate_marginal_gain(&self) -> u8 {
         if self.history.len() < 2 {
-            return 100; // Insufficient data, assume room for improvement
-        }
-
-        let len = self.history.len();
-        // Find last two records with different concurrency
-        let mut prev_idx = len - 1;
-        while prev_idx > 0 && self.history[prev_idx].0 == self.history[len - 1].0 {
-            prev_idx -= 1;
-        }
-
-        if prev_idx == 0 && self.history[0].0 == self.history[len - 1].0 {
-            return 100; // No comparable data
-        }
-
-        let (prev_jobs, prev_util) = self.history[prev_idx];
-        let (curr_jobs, curr_util) = self.history[len - 1];
-
-        if curr_jobs <= prev_jobs {
             return 100;
         }
 
-        // Gain per additional task
-        curr_util.saturating_sub(prev_util)
+        let last = *self.history.back().unwrap();
+        let prev = self
+            .history
+            .iter()
+            .rev()
+            .skip(1)
+            .find(|(jobs, _)| *jobs != last.0);
+
+        let Some(&(prev_jobs, prev_util)) = prev else {
+            return 100;
+        };
+
+        if last.0 <= prev_jobs {
+            return 100;
+        }
+
+        last.1.saturating_sub(prev_util)
     }
 
     pub fn current_max(&self) -> usize {
         self.current_max
     }
+
+    pub fn max_limit(&self) -> usize {
+        self.max_limit
+    }
 }
 
-/// Probe result
-pub struct ProbeResult {
-    #[allow(dead_code)]
-    pub gpu_impact: u8, // Single task's impact on GPU utilization
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Probe first video to evaluate single task GPU usage
-pub fn probe_gpu_impact(
-    first_video: &Path,
-    encoder_config: &EncoderConfig,
-    audio_bitrate: u32,
-) -> Result<ProbeResult> {
-    let mut monitor = GpuMonitor::new_for_encoder(encoder_config.encoder_type);
+    #[test]
+    fn parse_nvidia_smi_prefers_encoder_util_and_falls_back() {
+        assert_eq!(parse_nvidia_smi_utilization("68, 12\n"), 68);
+        assert_eq!(parse_nvidia_smi_utilization("[N/A], 45\n"), 45);
+        assert_eq!(parse_nvidia_smi_utilization(""), 0);
+    }
 
-    // Record baseline
-    let baseline_util = monitor.force_refresh()?;
-    println!("  探测: GPU 基线利用率 {}%", baseline_util);
+    #[test]
+    fn controller_ramps_up_backs_off_and_bounds_history() {
+        let mut ctrl = ConcurrencyController::new(1, 4);
+        assert_eq!(ctrl.current_max(), 1);
 
-    // Execute a brief preview encode
-    let start = Instant::now();
-    let _ = preview_encode(first_video, 23, encoder_config, audio_bitrate, 5, 0.0);
-    let elapsed = start.elapsed();
+        // Running 1 job at 30% -> should increase to 2
+        assert_eq!(ctrl.decide(30, 1), ConcurrencyAction::Increase);
+        assert_eq!(ctrl.current_max(), 2);
 
-    // Get GPU utilization during encoding
-    let peak_util = monitor.force_refresh()?;
-    let gpu_impact = peak_util.saturating_sub(baseline_util).max(10); // Assume at least 10%
+        // Running 1 < current_max(2) -> maintain while filling
+        assert_eq!(ctrl.decide(35, 1), ConcurrencyAction::Maintain);
 
-    println!("  探测完成: 耗时 {:?}, GPU 影响 {}%", elapsed, gpu_impact);
+        // Running 2 jobs at 65% (gain +30%) -> increase to 3
+        assert_eq!(ctrl.decide(65, 2), ConcurrencyAction::Increase);
+        assert_eq!(ctrl.current_max(), 3);
 
-    Ok(ProbeResult { gpu_impact })
-}
+        // Overloaded at 95% -> decrease to 2
+        assert_eq!(ctrl.decide(95, 3), ConcurrencyAction::Decrease);
+        assert_eq!(ctrl.current_max(), 2);
 
-/// Estimate initial concurrency based on probe result
-pub fn estimate_initial_concurrency(_probe: &ProbeResult) -> usize {
-    // Start with 1 thread, let concurrency controller adjust based on GPU utilization
-    1
+        // Verify history stays bounded
+        for _ in 0..200 {
+            ctrl.decide(60, 2);
+        }
+        assert!(ctrl.history.len() <= MAX_HISTORY_LEN);
+    }
 }

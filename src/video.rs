@@ -1,33 +1,58 @@
-use crate::config::{EncoderConfig, EncoderType};
-use crate::encoder::{full_encode, preview_encode};
+use crate::config::{EncodeParams, EncoderConfig, EncoderType};
+use crate::encoder::{create_encoder, full_encode, preview_encode, JetsonEncoder, VideoEncoder};
 use crate::ffmpeg::get_video_info;
-use crate::utils::{format_size, get_output_path, safe_move_file};
+use crate::logging::{log_debug, log_info};
+use crate::model::{FileStats, ProcessResult};
+use crate::signal::is_shutdown_requested;
+use crate::state::StateCache;
+use crate::utils::{
+    atomic_replace_from_temp, create_temp_in_same_dir, file_mtime_secs, format_size,
+    get_output_path,
+};
 use anyhow::{Context, Result};
-use filetime::{set_file_times, FileTime};
 use std::path::Path;
-use tempfile::NamedTempFile;
 
-#[derive(Debug)]
-pub enum ProcessResult {
-    Converted(FileStats),
-    Skipped(String),
+const PREVIEW_CRF: u8 = 23;
+const PREVIEW_RATIO: f64 = 0.10;
+const MIN_PREVIEW_SECONDS: u32 = 5;
+/// Preview encode is typically ~1.8x smaller than full encode due to sampling/overhead.
+const CORRECTION_FACTOR: f64 = 1.8;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CrfDecision {
+    UseCrf(u8),
+    Skip(String),
 }
 
-#[derive(Debug, Default)]
-pub struct FileStats {
-    pub input_size: u64,
-    pub output_size: u64,
-    #[allow(dead_code)]
-    pub used_crf: u8,
-}
+/// Decide the final CRF based on predicted compression ratio, target ratio, and max CRF.
+/// Pure function extracted for clarity and unit testing.
+pub fn decide_crf(predicted_ratio: f64, min_compression_ratio: u8, max_crf: u8) -> CrfDecision {
+    let target_ratio = min_compression_ratio as f64 / 100.0;
+    if predicted_ratio >= target_ratio {
+        return CrfDecision::UseCrf(PREVIEW_CRF);
+    }
 
-#[derive(Debug, Default)]
-pub struct ConversionStats {
-    pub successful: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    pub total_input_size: u64,
-    pub total_output_size: u64,
+    let predicted_output_ratio = 1.0 - predicted_ratio;
+    let target_output_ratio = 1.0 - target_ratio;
+
+    if predicted_output_ratio <= 0.0 || target_output_ratio <= 0.0 {
+        return CrfDecision::Skip("无法计算有效CRF".to_string());
+    }
+
+    // Exponential extrapolation: CRF +6 ≈ bitrate halved
+    // new_crf = PREVIEW_CRF - 6 * log2(target_output_ratio / predicted_output_ratio)
+    let ratio = target_output_ratio / predicted_output_ratio;
+    let crf_delta = 6.0 * ratio.log2();
+    let extrapolated_crf = (PREVIEW_CRF as f64 - crf_delta).round() as i32;
+
+    if extrapolated_crf > max_crf as i32 {
+        return CrfDecision::Skip(format!(
+            "需要CRF={} 超出限制({})",
+            extrapolated_crf, max_crf
+        ));
+    }
+
+    CrfDecision::UseCrf(extrapolated_crf.max(PREVIEW_CRF as i32) as u8)
 }
 
 pub fn process_video(
@@ -36,199 +61,114 @@ pub fn process_video(
     max_crf: u8,
     min_compression_ratio: u8,
     audio_bitrate: u32,
+    state_cache: Option<&StateCache>,
 ) -> Result<ProcessResult> {
-    const PREVIEW_CRF: u8 = 23; // Fixed preview CRF
-    const PREVIEW_RATIO: f64 = 0.10; // Preview duration is 10% of video
-    const MIN_PREVIEW_SECONDS: u32 = 5; // Minimum 5 seconds preview
-    const JETSON_MAX_PREVIEW_SECONDS: u32 = 10; // Jetson CPU is slow, cap at 10s
+    if is_shutdown_requested() {
+        anyhow::bail!("收到中断信号，跳过处理");
+    }
 
-    println!("处理视频: {}", input_path.display());
+    let output_path = get_output_path(input_path);
 
-    // Get input file metadata (for later restoration)
+    // Guard against clobbering a pre-existing distinct .mp4 target BEFORE probing/encoding.
+    if output_path.exists() && output_path != input_path {
+        return Ok(ProcessResult::Skipped(format!(
+            "目标已存在，跳过避免覆盖: {}",
+            output_path.display()
+        )));
+    }
+
     let original_metadata =
         std::fs::metadata(input_path).context("无法读取输入文件元数据")?;
-
-    // Get input file size
     let input_size = original_metadata.len();
+    let mtime_secs = file_mtime_secs(&original_metadata);
 
-    // Get video info
+    if let Some(cache) = state_cache
+        && let Some(reason) = cache.get_cached_skip(input_path, input_size, mtime_secs)
+    {
+        return Ok(ProcessResult::Skipped(format!("{} (缓存)", reason)));
+    }
+
+    let record_skip = |reason: String| -> Result<ProcessResult> {
+        if let Some(cache) = state_cache {
+            cache.record_skip(input_path, input_size, mtime_secs, &reason);
+        }
+        Ok(ProcessResult::Skipped(reason))
+    };
+
+    log_info(&format!("处理视频: {}", input_path.display()));
+
     let video_info = get_video_info(input_path)?;
     let duration = video_info.duration;
 
-    // Check source codec
     let is_hevc = video_info
         .codec_name
         .as_deref()
-        .map(|c| c.to_lowercase().contains("hevc") || c.to_lowercase().contains("h265"))
+        .map(|c| {
+            let lower = c.to_ascii_lowercase();
+            lower.contains("hevc") || lower.contains("h265")
+        })
         .unwrap_or(false);
 
-    println!(
+    log_info(&format!(
         "  源编码: {} | 分辨率: {}x{} | 时长: {:.1}s",
         video_info.codec_name.as_deref().unwrap_or("unknown"),
         video_info.width,
         video_info.height,
         duration
-    );
+    ));
 
-    // Already HEVC, skip
     if is_hevc {
-        return Ok(ProcessResult::Skipped("已是H.265编码".to_string()));
+        return record_skip("已是H.265编码".to_string());
     }
 
-    // GIF: treat as a short video, always encode with CPU at fixed CRF=23.
-    // Skip preview/extrapolation and never use hardware encoders (animated GIF
-    // frame layouts and palette decode poorly through NVENC/NVMPI).
-    let is_gif = input_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("gif"))
-        .unwrap_or(false);
+    // Select encoder backend and fall back to CPU if unsupported (e.g. Jetson small resolution).
+    let primary_encoder = create_encoder(encoder_config.encoder_type);
+    let active_encoder: Box<dyn VideoEncoder> = if primary_encoder.supports_video(&video_info) {
+        primary_encoder
+    } else {
+        log_info(&format!(
+            "  注意: 分辨率 {}x{} 低于Jetson最小要求({}x{})，回退到CPU编码",
+            video_info.width,
+            video_info.height,
+            JetsonEncoder::MIN_DIMENSION,
+            JetsonEncoder::MIN_DIMENSION
+        ));
+        create_encoder(EncoderType::Cpu)
+    };
 
-    if is_gif {
-        println!("  (GIF: 强制CPU编码, CRF=23)");
-        let gif_config = EncoderConfig {
-            encoder_type: EncoderType::Cpu,
-            preset: encoder_config.preset.clone(),
-            target_bitrate_kbps: None,
-            use_2pass: false,
-        };
-
-        let output_size = finalize_encode(
-            input_path,
-            PREVIEW_CRF,
-            &gif_config,
-            audio_bitrate,
-            Some("yuv420p"),
-            &original_metadata,
-        )?;
-
-        let actual_ratio = 1.0 - output_size as f64 / input_size as f64;
-        println!(
-            "  实际压缩: {} -> {} ({:.1}%)",
-            format_size(input_size),
-            format_size(output_size),
-            actual_ratio * 100.0
-        );
-
-        return Ok(ProcessResult::Converted(FileStats {
-            input_size,
-            output_size,
-            used_crf: PREVIEW_CRF,
-        }));
-    }
-
-    // Jetson NVMPI HEVC encoder has minimum resolution requirements (~160x160).
-    // Below that, it enters an infinite error loop instead of failing cleanly.
-    // Fall back to CPU encoding for small-resolution videos.
-    let jetson_min_dim: u32 = 160;
-    let needs_cpu_fallback = encoder_config.encoder_type == EncoderType::Jetson
-        && (video_info.width < jetson_min_dim || video_info.height < jetson_min_dim);
-
-    // Calculate preview duration: 10% of video, minimum 5 seconds
-    // Jetson: cap at 10 seconds because CPU is slow
+    // Preview duration: 10% of video, minimum 5s, optional backend cap (Jetson 10s).
     let preview_duration = if duration > 0.0 {
-        let preview_from_ratio = (duration * PREVIEW_RATIO) as u32;
-        let base_duration = preview_from_ratio
+        let base = ((duration * PREVIEW_RATIO) as u32)
             .max(MIN_PREVIEW_SECONDS)
-            .min(duration as u32);
-
-        if encoder_config.encoder_type == EncoderType::Jetson {
-            base_duration.min(JETSON_MAX_PREVIEW_SECONDS)
+            .min((duration as u32).max(1));
+        if let Some(cap) = active_encoder.preview_max_seconds() {
+            base.min(cap)
         } else {
-            base_duration
+            base
         }
     } else {
         MIN_PREVIEW_SECONDS
     };
 
-    println!(
+    let preview_encoder = active_encoder.preview_encoder();
+    if active_encoder.encoder_type() == EncoderType::Jetson {
+        log_info("  (Jetson: 使用CPU预览编码获取基准比特率)");
+    }
+    log_info(&format!(
         "  预览编码 ({}秒, CRF={})...",
         preview_duration, PREVIEW_CRF
-    );
+    ));
 
-    // For Jetson: preview encoding uses CPU to get baseline bitrate
-    // Then Jetson full encode uses target_bitrate = CPU_bitrate * 1.8
-    // If resolution is below Jetson minimum, entire pipeline falls back to CPU
-    let (preview_config, jetson_target_bitrate) = if needs_cpu_fallback {
-        let cpu_config = EncoderConfig {
-            encoder_type: EncoderType::Cpu,
-            preset: encoder_config.preset.clone(),
-            target_bitrate_kbps: None,
-            use_2pass: false,
-        };
-        println!(
-            "  注意: 分辨率 {}x{} 低于Jetson最小要求({}x{})，回退到CPU编码",
-            video_info.width, video_info.height, jetson_min_dim, jetson_min_dim
-        );
-        (cpu_config, false)
-    } else if encoder_config.encoder_type == EncoderType::Jetson {
-        // Create CPU config for preview encoding
-        let cpu_config = EncoderConfig {
-            encoder_type: EncoderType::Cpu,
-            preset: encoder_config.preset.clone(),
-            target_bitrate_kbps: None,
-            use_2pass: false,
-        };
-        println!("  (Jetson: 使用CPU预览编码获取基准比特率)");
-        (cpu_config, true) // flag to calculate target bitrate later
-    } else {
-        (encoder_config.clone(), false)
-    };
-
-    // Execute preview encode
+    let preview_params = EncodeParams::from_crf(PREVIEW_CRF, &encoder_config.preset);
     let preview_result = preview_encode(
         input_path,
-        PREVIEW_CRF,
-        &preview_config,
+        &preview_params,
+        preview_encoder.as_ref(),
         audio_bitrate,
         preview_duration,
         duration,
     )?;
 
-    // For Jetson: calculate target bitrate from preview result
-    // CPU CRF23 bitrate * 2.0 = Jetson equivalent quality bitrate
-    // If that exceeds 70% of original bitrate, cap at 70% and use maxrate constraint
-    let final_encoder_config = if jetson_target_bitrate {
-        let cpu_bitrate_bps = preview_result.output_size_per_second * 8.0; // bytes/sec to bits/sec
-        let ideal_jetson_bitrate_kbps = (cpu_bitrate_bps * 2.0 / 1000.0) as u32;
-
-        // Calculate 70% of original video bitrate
-        let original_bitrate_kbps = if video_info.bitrate > 0 {
-            (video_info.bitrate / 1000) as u32
-        } else {
-            // Fallback: estimate from file size
-            ((input_size as f64 / duration) * 8.0 / 1000.0) as u32
-        };
-        let max_bitrate_kbps = (original_bitrate_kbps as f64 * 0.7) as u32;
-
-        let (final_bitrate_kbps, use_bitrate_cap) = if ideal_jetson_bitrate_kbps > max_bitrate_kbps {
-            println!(
-                "  Jetson: 理想比特率 {}kbps > 原始70% ({}kbps)，使用70%限制",
-                ideal_jetson_bitrate_kbps, max_bitrate_kbps
-            );
-            (max_bitrate_kbps, true)
-        } else {
-            println!(
-                "  Jetson目标比特率: {}kbps (CPU基准×2.0)",
-                ideal_jetson_bitrate_kbps
-            );
-            (ideal_jetson_bitrate_kbps, false)
-        };
-
-        EncoderConfig {
-            encoder_type: EncoderType::Jetson,
-            preset: encoder_config.preset.clone(),
-            target_bitrate_kbps: Some(final_bitrate_kbps),
-            use_2pass: use_bitrate_cap,
-        }
-    } else {
-        encoder_config.clone()
-    };
-
-    // Calculate predicted compression ratio
-    // Use preview output per-second size to estimate full video size
-    // Apply correction factor (preview encode is typically ~1.8x smaller than full)
-    const CORRECTION_FACTOR: f64 = 1.8;
     let expected_output_size = preview_result.output_size_per_second * duration * CORRECTION_FACTOR;
     let predicted_ratio = if input_size > 0 {
         1.0 - expected_output_size / input_size as f64
@@ -236,87 +176,57 @@ pub fn process_video(
         0.0
     };
 
-    let target_ratio = min_compression_ratio as f64 / 100.0;
-
-    println!(
+    log_info(&format!(
         "  预估压缩比: {:.1}% (目标: {}%)",
         predicted_ratio * 100.0,
         min_compression_ratio
+    ));
+
+    let final_crf = match decide_crf(predicted_ratio, min_compression_ratio, max_crf) {
+        CrfDecision::UseCrf(crf) => crf,
+        CrfDecision::Skip(reason) => return record_skip(reason),
+    };
+
+    let full_params = active_encoder.resolve_full_params(
+        final_crf,
+        &encoder_config.preset,
+        &preview_result,
+        &video_info,
+        input_size,
     );
 
-    // Decide CRF to use
-    let final_crf = if predicted_ratio >= target_ratio {
-        // Predicted ratio meets target, use CRF=23
-        PREVIEW_CRF
-    } else {
-        // Predicted ratio below target, extrapolate higher CRF
-        // Use exponential formula: CRF +6 ≈ bitrate halved
-        // new_output_ratio = old_output_ratio * 2^((old_crf - new_crf) / 6)
-        let predicted_output_ratio = 1.0 - predicted_ratio; // output/input ratio
-        let target_output_ratio = 1.0 - target_ratio;
+    log_info(&format!("  使用 CRF={} 进行完整编码...", final_crf));
+    log_debug(&format!("  完整编码参数: {:?}", full_params));
 
-        if predicted_output_ratio <= 0.0 || target_output_ratio <= 0.0 {
-            return Ok(ProcessResult::Skipped("无法计算有效CRF".to_string()));
-        }
-
-        // target_output_ratio = predicted_output_ratio * 2^((PREVIEW_CRF - new_crf) / 6)
-        // 2^((PREVIEW_CRF - new_crf) / 6) = target_output_ratio / predicted_output_ratio
-        // new_crf = PREVIEW_CRF - 6 * log2(target_output_ratio / predicted_output_ratio)
-        let ratio = target_output_ratio / predicted_output_ratio;
-        let log2_ratio = ratio.log2();
-        let crf_delta = 6.0 * log2_ratio;
-        let extrapolated_crf = (PREVIEW_CRF as f64 - crf_delta).round() as i32;
-
-        println!(
-            "  外推CRF: {} (需要减少输出至 {:.1}%)",
-            extrapolated_crf,
-            target_output_ratio * 100.0
-        );
-
-        // Check if exceeds max CRF limit
-        if extrapolated_crf > max_crf as i32 {
-            return Ok(ProcessResult::Skipped(format!(
-                "需要CRF={} 超出限制({})",
-                extrapolated_crf, max_crf
-            )));
-        }
-
-        // Ensure CRF is in valid range
-        extrapolated_crf.max(PREVIEW_CRF as i32) as u8
-    };
-
-    println!("  使用 CRF={} 进行完整编码...", final_crf);
-
-    // If resolution below Jetson minimum, use CPU config instead
-    let cpu_fallback_config;
-    let effective_config = if needs_cpu_fallback {
-        cpu_fallback_config = EncoderConfig {
-            encoder_type: EncoderType::Cpu,
-            preset: encoder_config.preset.clone(),
-            target_bitrate_kbps: None,
-            use_2pass: false,
-        };
-        &cpu_fallback_config
-    } else {
-        &final_encoder_config
-    };
-
-    let output_size = finalize_encode(
+    // Crash-safe replacement: encode into a temp file in the SAME directory as output_path.
+    let temp_file = create_temp_in_same_dir(&output_path, ".mp4")?;
+    let output_size = full_encode(
         input_path,
-        final_crf,
-        effective_config,
+        temp_file.path(),
+        &full_params,
+        active_encoder.as_ref(),
         audio_bitrate,
-        None,
-        &original_metadata,
     )?;
 
-    let actual_ratio = 1.0 - output_size as f64 / input_size as f64;
-    println!(
+    // Post-encode size guard: never replace the original with a larger file!
+    if output_size >= input_size {
+        drop(temp_file);
+        return record_skip(format!(
+            "编码后体积更大 ({} >= {})，保留原文件",
+            format_size(output_size),
+            format_size(input_size)
+        ));
+    }
+
+    atomic_replace_from_temp(temp_file, input_path, &output_path, &original_metadata)?;
+
+    let actual_ratio = (1.0 - output_size as f64 / input_size as f64) * 100.0;
+    log_info(&format!(
         "  实际压缩: {} -> {} ({:.1}%)",
         format_size(input_size),
         format_size(output_size),
-        actual_ratio * 100.0
-    );
+        actual_ratio
+    ));
 
     Ok(ProcessResult::Converted(FileStats {
         input_size,
@@ -325,43 +235,29 @@ pub fn process_video(
     }))
 }
 
-/// Encode into a temp MP4, atomically replace the original file, and restore
-/// the original access/modification times and permissions. Returns output size.
-fn finalize_encode(
-    input_path: &Path,
-    final_crf: u8,
-    config: &EncoderConfig,
-    audio_bitrate: u32,
-    pix_fmt: Option<&str>,
-    original_metadata: &std::fs::Metadata,
-) -> Result<u64> {
-    let original_atime = FileTime::from_last_access_time(original_metadata);
-    let original_mtime = FileTime::from_last_modification_time(original_metadata);
-    let original_permissions = original_metadata.permissions();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Create temp file for encoding
-    let temp_file = NamedTempFile::with_suffix(".mp4").context("无法创建临时文件")?;
-    let temp_path = temp_file.path();
+    #[test]
+    fn decide_crf_uses_preview_crf_when_target_met() {
+        assert_eq!(decide_crf(0.45, 30, 35), CrfDecision::UseCrf(23));
+        assert_eq!(decide_crf(0.30, 30, 35), CrfDecision::UseCrf(23));
+    }
 
-    let output_size = full_encode(input_path, temp_path, final_crf, config, audio_bitrate, pix_fmt)?;
+    #[test]
+    fn decide_crf_extrapolates_within_limit() {
+        // predicted_ratio = 0.0 -> output_ratio = 1.0, target_output_ratio = 0.7
+        // 23 - 6 * log2(0.7) ≈ 23 + 3.09 = 26
+        assert_eq!(decide_crf(0.0, 30, 35), CrfDecision::UseCrf(26));
+    }
 
-    // Generate final output path
-    let output_path = get_output_path(input_path);
-
-    // Delete original file
-    std::fs::remove_file(input_path).context("无法删除原文件")?;
-
-    // Move temp file to output path
-    safe_move_file(temp_path, &output_path).context("无法移动输出文件")?;
-
-    // Restore timestamps and permissions
-    set_file_times(&output_path, original_atime, original_mtime)
-        .context("无法设置文件时间戳")?;
-    std::fs::set_permissions(&output_path, original_permissions)
-        .context("无法设置文件权限")?;
-
-    // Consume temp_file to avoid deletion
-    let _ = temp_file;
-
-    Ok(output_size)
+    #[test]
+    fn decide_crf_skips_when_exceeding_max_crf() {
+        // predicted_ratio = -3.0 -> output_ratio = 4.0, target = 0.7 -> 23 + 6*log2(4/0.7) ≈ 38 > 35
+        match decide_crf(-3.0, 30, 35) {
+            CrfDecision::Skip(reason) => assert!(reason.contains("超出限制(35)")),
+            other => panic!("expected Skip, got {:?}", other),
+        }
+    }
 }

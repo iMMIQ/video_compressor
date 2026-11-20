@@ -134,10 +134,12 @@ make build   # 标准构建
 | `--min-compression-ratio` | H264源最小压缩比(%) | 30 |
 | `--preset` | 编码预设 | medium |
 | `-a, --audio-bitrate` | 音频比特率(kbps)，0保留原音频 | 128 |
-| `-j, --jobs` | 并发任务数 | 1 |
+| `-j, --jobs` | 最大并发任务数 (0=自动：GPU动态至8，CPU/Jetson为1，图片≤8) | 0 |
 | `--serial` | 强制串行处理 | false |
 | `--dry-run` | 仅扫描不执行 | false |
 | `--repair-webp` | 修复旧版本生成的 EXIF-first WebP 后退出 | false |
+| `--log-level` | 日志级别 (quiet/info/debug) | info |
+| `--state-file` | 持久化跳过缓存文件，避免重跑重复探测/预览 | 无 |
 
 ### CRF 参考值
 
@@ -181,15 +183,21 @@ ffmpeg -encoders | grep nvmpi
 ```
 .
 ├── src/
-│   ├── main.rs       # 程序入口，CLI参数解析
-│   ├── config.rs     # 编码器配置
-│   ├── encoder.rs    # 编码逻辑
-│   ├── ffmpeg.rs     # FFmpeg/ffprobe调用
-│   ├── gpu.rs        # GPU编码器检测
-│   ├── scheduler.rs  # GPU并行调度器
-│   ├── scanner.rs    # 视频文件扫描
-│   ├── utils.rs      # 工具函数
-│   └── video.rs      # 视频处理逻辑
+│   ├── main.rs       # 程序入口，CLI参数解析与单次遍历管线编排
+│   ├── config.rs     # 编码器类型与参数定义
+│   ├── model.rs      # 公共媒体模型与分类统计
+│   ├── encoder.rs    # VideoEncoder策略抽象、预览/全量编码逻辑
+│   ├── ffmpeg.rs     # FFmpeg/ffprobe调用与单次编码器能力探测
+│   ├── gpu.rs        # GPU编码器利用率监控与动态并发控制器
+│   ├── scheduler.rs  # 固定线程池 + 事件驱动并发调度器
+│   ├── scanner.rs    # 单次流式媒体文件扫描
+│   ├── video.rs      # 视频智能压缩决策与原子替换
+│   ├── image.rs      # 图片转WebP与EXIF保留
+│   ├── webp_mux.rs   # libwebp合规VP8X/EXIF封装与原位修复
+│   ├── state.rs      # 可选增量跳过缓存
+│   ├── signal.rs     # SIGINT/SIGTERM优雅退出与子进程清理
+│   ├── logging.rs    # 线程安全分级日志
+│   └── utils.rs      # 原子替换、大小格式化与路径工具
 ├── Cargo.toml        # 项目配置
 ├── .cargo/
 │   └── config.toml   # 静态链接配置

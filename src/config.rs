@@ -2,19 +2,37 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderType {
     Cpu,
-    Gpu,      // Standard NVENC (desktop GPUs)
-    Jetson,   // Jetson NVMPI (Jetson devices)
+    Gpu,    // Standard NVENC (desktop GPUs)
+    Jetson, // Jetson NVMPI (Jetson devices)
 }
 
-/// Encoder configuration
+/// Global encoder configuration passed from CLI.
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
     pub encoder_type: EncoderType,
     pub preset: String,
-    /// Target bitrate in kbps (for Jetson bitrate-based encoding)
-    /// None = use CRF-based default mapping
-    pub target_bitrate_kbps: Option<u32>,
-    /// Use 2-pass encoding (for Jetson when bitrate is capped)
-    pub use_2pass: bool,
 }
 
+/// Concrete encoding parameters resolved for a single encode invocation.
+#[derive(Debug, Clone)]
+pub struct EncodeParams {
+    pub crf: u8,
+    pub preset: String,
+    pub pix_fmt: Option<String>,
+    /// Target bitrate in kbps (used by Jetson bitrate-based encoding).
+    pub target_bitrate_kbps: Option<u32>,
+    /// Optional maxrate cap in kbps (used by Jetson when capped to 70% of source).
+    pub maxrate_kbps: Option<u32>,
+}
+
+impl EncodeParams {
+    pub fn from_crf(crf: u8, preset: &str) -> Self {
+        Self {
+            crf,
+            preset: preset.to_string(),
+            pix_fmt: None,
+            target_bitrate_kbps: None,
+            maxrate_kbps: None,
+        }
+    }
+}

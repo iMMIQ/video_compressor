@@ -72,15 +72,21 @@ The application is a modular CLI tool with the following structure:
 
 ```
 src/
-├── main.rs       # Entry point, CLI parsing with clap
-├── config.rs     # EncoderConfig, EncoderType definitions
-├── encoder.rs    # Encoding logic (preview/full encode)
-├── ffmpeg.rs     # FFmpeg/ffprobe invocations, encoder detection
-├── gpu.rs        # NVENC/NVMPI availability checks
-├── scheduler.rs  # GPU parallel processing scheduler
-├── scanner.rs    # Streaming video file discovery
-├── utils.rs      # Helper functions (size formatting, path handling)
-└── video.rs      # Video processing workflow (process_video)
+├── main.rs       # Entry point, CLI parsing, single-pass pipeline orchestration
+├── config.rs     # EncoderType, EncoderConfig, EncodeParams definitions
+├── model.rs      # Shared MediaItem, ProcessResult, FileStats, ConversionStats
+├── encoder.rs    # VideoEncoder strategy trait (CPU/GPU/Jetson), preview/full encode
+├── ffmpeg.rs     # FFmpeg/ffprobe key=value parsing & single-call encoder detection
+├── gpu.rs        # NVENC encoder utilization monitor & bounded ConcurrencyController
+├── scheduler.rs  # Fixed worker pool + event-driven dynamic GPU/CPU schedulers
+├── scanner.rs    # Single-pass streaming media & WebP scanner (NFS-friendly file_type)
+├── video.rs      # Video compression decision logic (decide_crf) & safe replacement
+├── image.rs      # Image-to-WebP conversion with EXIF preservation
+├── webp_mux.rs   # libwebp VP8X/EXIF muxing and in-place repair
+├── state.rs      # Optional persistent skip-cache (--state-file)
+├── signal.rs     # SIGINT/SIGTERM graceful shutdown & cancellable subprocess runner
+├── logging.rs    # Thread-safe leveled logging (--log-level)
+└── utils.rs      # Crash-safe atomic_replace_from_temp, size formatting, path helpers
 ```
 
 ### Processing Pipeline

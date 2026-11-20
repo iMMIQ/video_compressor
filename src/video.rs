@@ -12,8 +12,8 @@ use crate::model::{FileStats, ProcessResult};
 use crate::signal::is_shutdown_requested;
 use crate::state::StateCache;
 use crate::utils::{
-    atomic_replace_from_temp, create_temp_in_same_dir, file_mtime_secs, format_size,
-    get_output_path,
+    atomic_replace_from_temp, available_space_bytes, copy_file_to_temp, create_temp_in_same_dir,
+    file_mtime_secs, format_size, get_output_path, is_network_filesystem,
 };
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -467,7 +467,7 @@ pub fn process_video(
         encoder_config.capabilities.has_libx264,
     )?;
 
-    let mut full_params = if active_encoder.supports_quality_search() {
+    let (mut full_params, predicted_output_bytes) = if active_encoder.supports_quality_search() {
         let profile = active_encoder.quality_profile(max_crf);
         let search = search_perceptual_quality(
             active_encoder.as_ref(),
@@ -529,7 +529,12 @@ pub fn process_video(
         {
             p.maxrate_kbps = Some((src_video_kbps as f64 * 1.35) as u32);
         }
-        p
+        let est_bytes = if duration > 0.0 {
+            predict_total_output_bytes(search.est_video_bps, audio_bps, duration) as u64
+        } else {
+            input_size
+        };
+        (p, est_bytes)
     } else {
         // Legacy JetsonNvmpi fallback (bitrate-based, audio cleanly excluded).
         let cpu_enc = create_encoder_of(EncoderType::Cpu, &encoder_config.capabilities);
@@ -561,7 +566,12 @@ pub fn process_video(
             EncodeParams::for_quality(search.chosen_q, &encoder_config.preset, false, false);
         p.target_bitrate_kbps = Some(target_kbps);
         p.maxrate_kbps = Some((target_kbps as f64 * 1.5) as u32);
-        p
+        let est_bytes = if duration > 0.0 {
+            predict_total_output_bytes(target_v_bps, audio_bps, duration) as u64
+        } else {
+            input_size
+        };
+        (p, est_bytes)
     };
     drop(sample); // Release sample temp file immediately before full encode.
 
@@ -570,7 +580,27 @@ pub fn process_video(
     }
 
     // === Layer 3: Full hardware encode + real-time size watchdog ===
-    let temp_file = create_temp_in_same_dir(&output_path, ".mp4")?;
+    // On network filesystems (NFS/SMB/FUSE), stage the final `+faststart` MP4 on fast local `/tmp`
+    // whenever `/tmp` has ample headroom (eliminating the 3x network I/O of `+faststart` moov
+    // relocation), validate locally, and perform a single 1 MiB-buffered sequential write to NFS.
+    let tmp_dir = std::env::temp_dir();
+    let needed_local_bytes = predicted_output_bytes
+        .saturating_mul(2)
+        .saturating_add(1024 * 1024 * 1024);
+    let use_local_staging = is_network_filesystem(&output_path)
+        && available_space_bytes(&tmp_dir)
+            .map(|avail| avail >= needed_local_bytes)
+            .unwrap_or(false);
+
+    let encode_temp = if use_local_staging {
+        log_debug(
+            "  [NFS优化] 输出目录为网络存储且本地临时盘空间充足，+faststart 与校验将在本地暂存后单次顺序回写",
+        );
+        NamedTempFile::with_suffix(".mp4").context("无法在本地临时目录创建暂存MP4")?
+    } else {
+        create_temp_in_same_dir(&output_path, ".mp4")?
+    };
+
     let separate_video_track = active_encoder.encoder_type() == EncoderType::JetsonGst;
     let watchdog_limit =
         compute_watchdog_limit(input_size, duration, audio_bps, separate_video_track);
@@ -584,14 +614,14 @@ pub fn process_video(
     let output_size = match active_encoder.full_encode(
         input_path,
         &video_info,
-        temp_file.path(),
+        encode_temp.path(),
         &full_params,
         audio_plan,
         watchdog_limit,
         hw_slots,
     )? {
         EncodeOutcome::AbortedSizeLimit { written_bytes } => {
-            drop(temp_file);
+            drop(encode_temp);
             return record_skip(
                 format!(
                     "编码中体积已达 {} (接近/超过原片 {})，已提前熔断保留原文件",
@@ -609,17 +639,17 @@ pub fn process_video(
     {
         Ok(pct) => pct,
         Err(reason) => {
-            drop(temp_file);
+            drop(encode_temp);
             return record_skip(reason, false);
         }
     };
 
     // Integrity check: verify valid video stream & matching duration so a truncated encode
     // can NEVER masquerade as a "smaller file" and overwrite the original!
-    match probe_output_integrity(temp_file.path()) {
+    match probe_output_integrity(encode_temp.path()) {
         Some(out_dur) if is_duration_consistent(duration, out_dur) => {}
         Some(out_dur) => {
-            drop(temp_file);
+            drop(encode_temp);
             anyhow::bail!(
                 "输出时长异常截断 (原片 {:.1}s vs 输出 {:.1}s)，已拒绝替换并保留原文件",
                 duration,
@@ -627,12 +657,27 @@ pub fn process_video(
             );
         }
         None => {
-            drop(temp_file);
+            drop(encode_temp);
             anyhow::bail!("输出文件视频流校验失败，已拒绝替换并保留原文件");
         }
     }
 
-    atomic_replace_from_temp(temp_file, input_path, &output_path, &original_metadata)?;
+    let final_same_dir_temp = if use_local_staging {
+        // Single 1 MiB-buffered sequential write over NFS, then drop local temp immediately.
+        let mut dst_temp = create_temp_in_same_dir(&output_path, ".mp4")?;
+        copy_file_to_temp(encode_temp.path(), &mut dst_temp)?;
+        drop(encode_temp);
+        dst_temp
+    } else {
+        encode_temp
+    };
+
+    atomic_replace_from_temp(
+        final_same_dir_temp,
+        input_path,
+        &output_path,
+        &original_metadata,
+    )?;
 
     log_info(&format!(
         "  实际压缩: {} -> {} ({:.1}% 节省)",

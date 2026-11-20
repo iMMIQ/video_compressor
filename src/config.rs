@@ -78,6 +78,7 @@ pub struct HardwareCapabilities {
     pub jetson_gst_ok: bool,
     pub jetson_gst_10bit: bool,
     pub jetson_gst_decoder: bool,
+    pub jetson_gst_audio_mux: bool,
 
     pub jetson_nvmpi_ok: bool,
 
@@ -107,6 +108,7 @@ impl Default for HardwareCapabilities {
             jetson_gst_ok: false,
             jetson_gst_10bit: false,
             jetson_gst_decoder: false,
+            jetson_gst_audio_mux: false,
             jetson_nvmpi_ok: false,
             qsv_ok: false,
             vaapi_ok: false,

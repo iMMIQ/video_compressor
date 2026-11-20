@@ -488,6 +488,9 @@ pub fn detect_hardware_capabilities() -> Result<HardwareCapabilities> {
         if caps.jetson_gst_ok {
             caps.jetson_gst_decoder = probe_gst_element_exists("nvv4l2decoder")
                 && probe_gst_element_exists("matroskamux");
+            caps.jetson_gst_audio_mux = probe_gst_element_exists("mp4mux")
+                && probe_gst_element_exists("aacparse")
+                && probe_gst_element_exists("avenc_aac");
         }
         if enc.nvmpi {
             caps.jetson_nvmpi_ok = probe_ffmpeg_hw_encode(&["-c:v", "hevc_nvmpi", "-b:v", "1000k"]);
@@ -1133,6 +1136,32 @@ pub fn probe_output_integrity(path: &Path) -> Option<f64> {
     }
 
     if has_video { duration } else { None }
+}
+
+/// Probe whether a media file contains a valid audio stream (used to validate
+/// single-pass audio extraction before skipping fallback to original input).
+pub fn probe_has_audio(path: &Path) -> bool {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "csv=p=0",
+    ])
+    .arg(path);
+
+    run_command_cancellable(&mut cmd, "校验暂存音频流失败")
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .eq_ignore_ascii_case("audio")
+        })
+        .unwrap_or(false)
 }
 
 /// Probe the real duration (seconds) of a media file via ffprobe.

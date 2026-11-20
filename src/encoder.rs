@@ -1,5 +1,5 @@
 use crate::config::{EncodeParams, EncoderConfig, EncoderType, HardwareCapabilities, QualityProfile};
-use crate::ffmpeg::{AudioPlan, VideoInfo, probe_duration};
+use crate::ffmpeg::{AudioPlan, VideoInfo, probe_duration, probe_has_audio};
 use crate::logging::{log_debug, log_info};
 use crate::signal::{
     SizeWatchdog, WatchedOutcome, run_command_cancellable, run_command_watched,
@@ -631,7 +631,44 @@ impl JetsonGstEncoder {
         }
     }
 
+    /// Build the GStreamer parallel audio branch (`<parser/transcode> ! mp4mux`) so audio is
+    /// demuxed/transcoded in the EXACT SAME single sequential read pass as video (critical on NFS!).
+    fn build_gst_audio_branch(&self, info: &VideoInfo, audio_plan: AudioPlan) -> Option<Vec<String>> {
+        if !self.caps.jetson_gst_audio_mux || !info.has_audio {
+            return None;
+        }
+        match audio_plan {
+            AudioPlan::None => None,
+            AudioPlan::Copy => {
+                let codec = info.audio_codec.as_deref()?.to_ascii_lowercase();
+                let parser = match codec.as_str() {
+                    "aac" => "aacparse",
+                    "mp3" => "mpegaudioparse",
+                    "ac3" | "eac3" => "ac3parse",
+                    _ => return None,
+                };
+                Some(vec![parser.to_string(), "!".to_string(), "mp4mux".to_string()])
+            }
+            AudioPlan::TranscodeAac(kbps) => Some(vec![
+                "decodebin".to_string(),
+                "!".to_string(),
+                "audioconvert".to_string(),
+                "!".to_string(),
+                "audioresample".to_string(),
+                "!".to_string(),
+                "avenc_aac".to_string(),
+                format!("bitrate={}", kbps.saturating_mul(1000)),
+                "!".to_string(),
+                "aacparse".to_string(),
+                "!".to_string(),
+                "mp4mux".to_string(),
+            ]),
+        }
+    }
+
     /// Path A: Full NVMM zero-copy decode -> color/10-bit VIC -> NVENC H.265 -> Matroska (preserves PTS/VFR).
+    /// When `audio_branch` and `out_aud_m4a` are provided, demuxes & copies/transcodes audio
+    /// concurrently in the SAME single sequential input read (eliminates second full-file NFS read!).
     #[allow(clippy::too_many_arguments)]
     fn run_zerocopy_encode(
         &self,
@@ -639,14 +676,57 @@ impl JetsonGstEncoder {
         demux: &str,
         parser: &str,
         out_mkv: &Path,
+        audio_branch: Option<&[String]>,
+        out_aud_m4a: Option<&Path>,
         params: &EncodeParams,
         max_bytes: Option<u64>,
         hw_slots: Option<&HwSlotPool>,
     ) -> Result<EncodeOutcome> {
         let mut cmd = Command::new("gst-launch-1.0");
         cmd.args(["-q", "-e", "filesrc"])
-            .arg(format!("location={}", input_path.to_string_lossy()))
-            .args([
+            .arg(format!("location={}", input_path.to_string_lossy()));
+
+        if let (Some(abranch), Some(aud_path)) = (audio_branch, out_aud_m4a) {
+            // Single-pass dual-branch pipeline: NVENC video + parallel CPU audio into separate muxers.
+            cmd.args(["!", demux, "name=d"])
+                .args([
+                    "d.video_0",
+                    "!",
+                    "queue",
+                    "max-size-buffers=0",
+                    "max-size-time=0",
+                    "max-size-bytes=0",
+                    "!",
+                    parser,
+                    "!",
+                    "nvv4l2decoder",
+                    "!",
+                    "nvvidconv",
+                    "!",
+                ])
+                .arg(self.nvmm_caps(params))
+                .arg("!");
+            for arg in self.build_nvv4l2_enc_args(params) {
+                cmd.arg(arg);
+            }
+            cmd.args(["!", "h265parse", "!", "matroskamux", "!", "filesink"])
+                .arg(format!("location={}", out_mkv.to_string_lossy()))
+                .args([
+                    "d.audio_0",
+                    "!",
+                    "queue",
+                    "max-size-buffers=0",
+                    "max-size-time=0",
+                    "max-size-bytes=0",
+                    "!",
+                ]);
+            for arg in abranch {
+                cmd.arg(arg);
+            }
+            cmd.args(["!", "filesink"])
+                .arg(format!("location={}", aud_path.to_string_lossy()));
+        } else {
+            cmd.args([
                 "!",
                 demux,
                 "!",
@@ -659,11 +739,12 @@ impl JetsonGstEncoder {
             ])
             .arg(self.nvmm_caps(params))
             .arg("!");
-        for arg in self.build_nvv4l2_enc_args(params) {
-            cmd.arg(arg);
+            for arg in self.build_nvv4l2_enc_args(params) {
+                cmd.arg(arg);
+            }
+            cmd.args(["!", "h265parse", "!", "matroskamux", "!", "filesink"])
+                .arg(format!("location={}", out_mkv.to_string_lossy()));
         }
-        cmd.args(["!", "h265parse", "!", "matroskamux", "!", "filesink"])
-            .arg(format!("location={}", out_mkv.to_string_lossy()));
 
         let watchdog = max_bytes.map(|limit| SizeWatchdog {
             watch_path: out_mkv,
@@ -696,11 +777,16 @@ impl JetsonGstEncoder {
 
     /// Path B: Universal compatibility pipe — standard FFmpeg SW decode (I420, CFR, even dims, noautorotate)
     /// -> OS pipe -> GStreamer `fdsrc ! rawvideoparse format=i420 ! nvvidconv(NVMM) ! nvv4l2h265enc ! matroskamux`.
+    /// When `out_aud_m4a` is provided, FFmpeg writes the audio track as a second output during the
+    /// SAME single input read!
+    #[allow(clippy::too_many_arguments)]
     fn run_pipe_encode(
         &self,
         input_path: &Path,
         info: &VideoInfo,
         out_mkv: &Path,
+        audio_plan: AudioPlan,
+        out_aud_m4a: Option<&Path>,
         params: &EncodeParams,
         max_bytes: Option<u64>,
         hw_slots: Option<&HwSlotPool>,
@@ -712,13 +798,23 @@ impl JetsonGstEncoder {
 
         let mut producer = Command::new("ffmpeg");
         producer
-            .args(["-hide_banner", "-v", "error", "-noautorotate", "-i"])
+            .args(["-y", "-hide_banner", "-v", "error", "-noautorotate", "-i"])
             .arg(input_path)
             .args(["-map", "0:v:0", "-an", "-fps_mode", "cfr", "-r", &fps_str]);
         if !info.width.is_multiple_of(2) || !info.height.is_multiple_of(2) {
             producer.args(["-vf", &format!("pad={}:{}:0:0", even_w, even_h)]);
         }
         producer.args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]);
+
+        // Second output in the same FFmpeg process: extract/transcode audio in one pass!
+        if let Some(aud_path) = out_aud_m4a
+            && info.has_audio
+            && !matches!(audio_plan, AudioPlan::None)
+        {
+            producer.args(["-map", "0:a:0?", "-vn"]);
+            audio_plan.append_ffmpeg_args(&mut producer);
+            producer.args(["-f", "mp4"]).arg(aud_path);
+        }
 
         let mut consumer = Command::new("gst-launch-1.0");
         consumer
@@ -779,11 +875,14 @@ impl JetsonGstEncoder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_video_track(
         &self,
         input_path: &Path,
         info: &VideoInfo,
         out_mkv: &Path,
+        audio_plan: AudioPlan,
+        out_aud_m4a: Option<&Path>,
         params: &EncodeParams,
         max_bytes: Option<u64>,
         hw_slots: Option<&HwSlotPool>,
@@ -799,8 +898,35 @@ impl JetsonGstEncoder {
             && self.caps.jetson_gst_decoder
             && let Some((demux, parser)) = info.gst_zerocopy_elements()
         {
+            let audio_branch = out_aud_m4a.and_then(|_| self.build_gst_audio_branch(info, audio_plan));
+            if let Some(ref abranch) = audio_branch {
+                match self.run_zerocopy_encode(
+                    input_path,
+                    demux,
+                    parser,
+                    out_mkv,
+                    Some(abranch.as_slice()),
+                    out_aud_m4a,
+                    params,
+                    max_bytes,
+                    hw_slots,
+                ) {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(e) => {
+                        log_debug(&format!(
+                            "Jetson单遍音视频零拷贝失败，回退纯视频零拷贝: {}",
+                            e
+                        ));
+                        let _ = std::fs::remove_file(out_mkv);
+                        if let Some(p) = out_aud_m4a {
+                            let _ = std::fs::remove_file(p);
+                        }
+                    }
+                }
+            }
+
             match self.run_zerocopy_encode(
-                input_path, demux, parser, out_mkv, params, max_bytes, hw_slots,
+                input_path, demux, parser, out_mkv, None, None, params, max_bytes, hw_slots,
             ) {
                 Ok(outcome) => return Ok(outcome),
                 Err(e) => {
@@ -813,37 +939,80 @@ impl JetsonGstEncoder {
             }
         }
 
-        self.run_pipe_encode(input_path, info, out_mkv, params, max_bytes, hw_slots)
+        self.run_pipe_encode(
+            input_path,
+            info,
+            out_mkv,
+            audio_plan,
+            out_aud_m4a,
+            params,
+            max_bytes,
+            hw_slots,
+        )
     }
 
-    /// Standard FFmpeg remux: millisecond-fast `-c:v copy` combining the NVENC video track
-    /// with original audio (smart copy/transcode), metadata, rotation, HDR tags, `hvc1`, `faststart`.
+    /// Standard FFmpeg remux: millisecond-fast pure `-c copy` when audio was extracted in-pass
+    /// (zero second NFS read!), falling back seamlessly to original input audio if needed.
     fn remux_to_mp4(
         video_mkv: &Path,
+        pre_extracted_audio: Option<&Path>,
         original_input: &Path,
         info: &VideoInfo,
         audio_plan: AudioPlan,
         output_mp4: &Path,
     ) -> Result<u64> {
+        let valid_local_audio = pre_extracted_audio.filter(|p| {
+            !matches!(audio_plan, AudioPlan::None)
+                && std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
+                && probe_has_audio(p)
+        });
+
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-y", "-hide_banner", "-v", "error"]);
         if info.rotation != 0 {
             cmd.arg("-display_rotation:v:0")
                 .arg(info.rotation.to_string());
         }
-        cmd.arg("-i")
-            .arg(video_mkv)
-            .arg("-i")
-            .arg(original_input)
-            .args(["-map", "0:v:0"]);
-        if !matches!(audio_plan, AudioPlan::None) {
-            cmd.args(["-map", "1:a:0?"]);
+
+        if let Some(aud_path) = valid_local_audio {
+            // FAST PATH: both video & audio are already local on SSD -> pure `-c copy`!
+            // `original_input` is only opened for container metadata header (never scans payloads!).
+            log_debug("  [合流优化] 命中单遍分流本地音频轨，纯 -c copy 极速合流 (免二次通读源文件)");
+            cmd.arg("-i")
+                .arg(video_mkv)
+                .arg("-i")
+                .arg(aud_path)
+                .arg("-i")
+                .arg(original_input)
+                .args([
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c",
+                    "copy",
+                    "-tag:v",
+                    "hvc1",
+                ]);
+            append_color_tags(&mut cmd, info);
+            cmd.args(["-map_metadata", "2", "-movflags", "+faststart"])
+                .arg(output_mp4);
+        } else {
+            // Fallback: read audio directly from original_input (e.g. AudioPlan::None or exotic codec).
+            cmd.arg("-i")
+                .arg(video_mkv)
+                .arg("-i")
+                .arg(original_input)
+                .args(["-map", "0:v:0"]);
+            if !matches!(audio_plan, AudioPlan::None) {
+                cmd.args(["-map", "1:a:0?"]);
+            }
+            cmd.args(["-c:v", "copy", "-tag:v", "hvc1"]);
+            append_color_tags(&mut cmd, info);
+            audio_plan.append_ffmpeg_args(&mut cmd);
+            cmd.args(["-map_metadata", "1", "-movflags", "+faststart"])
+                .arg(output_mp4);
         }
-        cmd.args(["-c:v", "copy", "-tag:v", "hvc1"]);
-        append_color_tags(&mut cmd, info);
-        audio_plan.append_ffmpeg_args(&mut cmd);
-        cmd.args(["-map_metadata", "1", "-movflags", "+faststart"])
-            .arg(output_mp4);
 
         let out = run_command_cancellable(&mut cmd, "FFmpeg合流封装MP4失败")?;
         if !out.status.success() {
@@ -889,8 +1058,16 @@ impl VideoEncoder for JetsonGstEncoder {
         params: &EncodeParams,
         hw_slots: Option<&HwSlotPool>,
     ) -> Result<u64> {
-        match self.encode_video_track(sample_path, sample_info, output_path, params, None, hw_slots)?
-        {
+        match self.encode_video_track(
+            sample_path,
+            sample_info,
+            output_path,
+            AudioPlan::None,
+            None,
+            params,
+            None,
+            hw_slots,
+        )? {
             EncodeOutcome::Completed(sz) => Ok(sz),
             EncodeOutcome::AbortedSizeLimit { .. } => unreachable!(),
         }
@@ -906,12 +1083,20 @@ impl VideoEncoder for JetsonGstEncoder {
         max_bytes: Option<u64>,
         hw_slots: Option<&HwSlotPool>,
     ) -> Result<EncodeOutcome> {
-        // Stage 1 (holds HW slot): hardware encode pure video to temp .mkv with size watchdog.
+        // Stage 1 (holds HW slot): single-pass hardware video encode + parallel local audio demux/transcode.
         let tmp_mkv = NamedTempFile::with_suffix(".mkv").context("无法创建临时视频轨文件")?;
+        let tmp_aud = if info.has_audio && !matches!(audio_plan, AudioPlan::None) {
+            Some(NamedTempFile::with_suffix(".m4a").context("无法创建临时音频轨文件")?)
+        } else {
+            None
+        };
+
         let mkv_outcome = self.encode_video_track(
             input_path,
             info,
             tmp_mkv.path(),
+            audio_plan,
+            tmp_aud.as_ref().map(|f| f.path()),
             params,
             max_bytes,
             hw_slots,
@@ -922,9 +1107,10 @@ impl VideoEncoder for JetsonGstEncoder {
                 Ok(EncodeOutcome::AbortedSizeLimit { written_bytes })
             }
             EncodeOutcome::Completed(_) => {
-                // Stage 2 (HW slot already released!): standard FFmpeg millisecond remux to MP4.
+                // Stage 2 (HW slot already released!): pure local -c copy remux to MP4.
                 let final_size = Self::remux_to_mp4(
                     tmp_mkv.path(),
+                    tmp_aud.as_ref().map(|f| f.path()),
                     input_path,
                     info,
                     audio_plan,
@@ -1665,6 +1851,40 @@ mod tests {
         assert!(full_args.contains(&"preset-level=3".to_string()));
         assert!(full_args.contains(&"profile=1".to_string()));
         assert!(full_args.contains(&"qp-range=27,29:25,27:27,29".to_string()));
+    }
+
+    #[test]
+    fn jetson_gst_audio_branch_handles_copy_and_transcode() {
+        let caps = HardwareCapabilities {
+            jetson_gst_ok: true,
+            jetson_gst_audio_mux: true,
+            ..Default::default()
+        };
+        let enc = JetsonGstEncoder { caps };
+        let aac_info = VideoInfo {
+            has_audio: true,
+            audio_codec: Some("aac".into()),
+            ..Default::default()
+        };
+        let branch_copy = enc
+            .build_gst_audio_branch(&aac_info, AudioPlan::Copy)
+            .unwrap();
+        assert_eq!(branch_copy, vec!["aacparse", "!", "mp4mux"]);
+
+        let branch_trans = enc
+            .build_gst_audio_branch(&aac_info, AudioPlan::TranscodeAac(128))
+            .unwrap();
+        assert!(branch_trans.contains(&"avenc_aac".to_string()));
+        assert!(branch_trans.contains(&"bitrate=128000".to_string()));
+        assert!(branch_trans.contains(&"mp4mux".to_string()));
+
+        // Opus copy falls back cleanly to FFmpeg remux
+        let opus_info = VideoInfo {
+            has_audio: true,
+            audio_codec: Some("opus".into()),
+            ..Default::default()
+        };
+        assert!(enc.build_gst_audio_branch(&opus_info, AudioPlan::Copy).is_none());
     }
 
     #[test]

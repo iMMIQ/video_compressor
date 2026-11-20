@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use filetime::{FileTime, set_file_times};
-use std::fs::Metadata;
+use std::fs::{File, Metadata};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
@@ -49,6 +50,105 @@ pub fn create_temp_in_same_dir(target_path: &Path, suffix: &str) -> Result<Named
         .unwrap_or_else(|| Path::new("."));
     NamedTempFile::with_suffix_in(suffix, parent)
         .with_context(|| format!("无法在 {} 创建临时文件", parent.display()))
+}
+
+/// Detect whether `path` resides on a network/remote filesystem (NFS, SMB/CIFS, FUSE, Ceph, Lustre).
+/// Used to stage `+faststart` MP4 rewrites on fast local `/tmp` and stream-copy once over the network.
+#[cfg(target_os = "linux")]
+pub fn is_network_filesystem(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let probe_path = if path.exists() {
+        path
+    } else {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    };
+    let Ok(cpath) = CString::new(probe_path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(cpath.as_ptr(), &mut stat) } != 0 {
+        return false;
+    }
+
+    // Standard Linux kernel filesystem magic constants
+    const NFS_SUPER_MAGIC: i64 = 0x6969;
+    const SMB_SUPER_MAGIC: i64 = 0x517B;
+    const CIFS_SUPER_MAGIC: i64 = 0xFF53_4D42;
+    const SMB2_SUPER_MAGIC: i64 = 0xFE53_4D42;
+    const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+    const CEPH_SUPER_MAGIC: i64 = 0x00C3_6400;
+    const LUSTRE_SUPER_MAGIC: i64 = 0x0BD0_0BD0;
+
+    let ftype = stat.f_type as i64;
+    matches!(
+        ftype,
+        NFS_SUPER_MAGIC
+            | SMB_SUPER_MAGIC
+            | CIFS_SUPER_MAGIC
+            | SMB2_SUPER_MAGIC
+            | FUSE_SUPER_MAGIC
+            | CEPH_SUPER_MAGIC
+            | LUSTRE_SUPER_MAGIC
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_network_filesystem(_path: &Path) -> bool {
+    false
+}
+
+/// Query free bytes available to unprivileged users on the filesystem containing `path`.
+#[cfg(unix)]
+pub fn available_space_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let probe_path = if path.exists() {
+        path
+    } else {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    };
+    let cpath = CString::new(probe_path.as_os_str().as_bytes()).ok()?;
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(cpath.as_ptr(), &mut vfs) } != 0 {
+        return None;
+    }
+    Some((vfs.f_bavail as u64).saturating_mul(vfs.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+pub fn available_space_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// Stream-copy a local staged file into a destination `NamedTempFile` using a 1 MiB buffer
+/// (maximizes sequential NFS write throughput while keeping memory bounded).
+pub fn copy_file_to_temp(src_path: &Path, dst_temp: &mut NamedTempFile) -> Result<u64> {
+    const BUF_SIZE: usize = 1024 * 1024; // 1 MiB sequential I/O buffer
+    let mut reader =
+        File::open(src_path).with_context(|| format!("无法打开暂存文件: {}", src_path.display()))?;
+    let writer = dst_temp.as_file_mut();
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut total: u64 = 0;
+
+    loop {
+        let n = reader.read(&mut buf).context("读取本地暂存文件失败")?;
+        if n == 0 {
+            break;
+        }
+        writer
+            .write_all(&buf[..n])
+            .context("写入目标目录临时文件失败")?;
+        total += n as u64;
+    }
+    writer.flush().context("刷新目标目录临时文件失败")?;
+    Ok(total)
 }
 
 /// Crash-safe file replacement:
@@ -153,5 +253,21 @@ mod tests {
         assert!(err.to_string().contains("拒绝覆盖"));
         assert_eq!(std::fs::read(&src).unwrap(), b"avi");
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing-mp4");
+    }
+
+    #[test]
+    fn local_tmp_space_and_buffered_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_network_filesystem(dir.path()));
+        assert!(available_space_bytes(dir.path()).unwrap_or(0) > 0);
+
+        let src = dir.path().join("staged.mp4");
+        let payload = vec![0xABu8; 2 * 1024 * 1024 + 123];
+        std::fs::write(&src, &payload).unwrap();
+
+        let mut dst = create_temp_in_same_dir(&dir.path().join("final.mp4"), ".mp4").unwrap();
+        let copied = copy_file_to_temp(&src, &mut dst).unwrap();
+        assert_eq!(copied, payload.len() as u64);
+        assert_eq!(std::fs::read(dst.path()).unwrap(), payload);
     }
 }

@@ -5,7 +5,8 @@
 ## 核心特性
 
 - **硬件优先 & 零自编译 FFmpeg**：
-  - **Jetson Orin / JetPack**：默认采用官方原生 **GStreamer `nvv4l2h265enc` (10-bit Main10) + `nvv4l2decoder` NVMM 零拷贝**，再由系统标准 `ffmpeg` 毫秒级 `-c:v copy` 合流封装（彻底告别自编译 `jetson-ffmpeg`；冷门格式自动走标准 `ffmpeg` 软解管道喂给硬件编码器；仍保留 `--encoder nvmpi` 兼容选项）
+  - **Jetson Orin / JetPack**：默认采用官方原生 **GStreamer `nvv4l2h265enc` (10-bit Main10) + `nvv4l2decoder` NVMM 零拷贝**，并在**同一次顺序读盘中并行完成音频分流/转码**，随后由系统标准 `ffmpeg` 纯 `-c copy` 毫秒级合流封装（彻底告别自编译 `jetson-ffmpeg`；冷门格式自动走标准 `ffmpeg` 多输出软解管道喂给硬件编码器；仍保留 `--encoder nvmpi` 兼容选项）
+  - **NFS / 网络存储 I/O 优化**：自动检测 NFS/SMB/FUSE 等网络挂载目录，本地临时盘空间充足时在本地 SSD 完成 `+faststart` 重排与完整性校验，再以 1 MiB 缓冲**单次顺序回写**并原子替换（消除二次通读大文件与 `+faststart` 三倍网络读写）
   - **桌面 NVIDIA GPU**：`hevc_nvenc`（10-bit Main10 + 条件 `-hwaccel_output_format cuda` 零拷贝 + `-bf 4 -b:v 0` + `-multipass qres` + 多 GPU 轮询 + 会话数上限自动降并发重试）
   - **跨平台硬件**：自动运行时探测并支持 **Intel QSV (`hevc_qsv`)**、**Linux VA-API (`hevc_vaapi`)**、**AMD AMF (`hevc_amf`)**、**Apple VideoToolbox (`hevc_videotoolbox`)**
   - **CPU 兜底**：`libx265` 10-bit + 心理视觉优化 (`aq-mode=3:limit-sao=1:deblock=-1,-1`)

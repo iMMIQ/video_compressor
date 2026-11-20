@@ -19,7 +19,7 @@ struct CachedSkip {
 /// or minimum saving ratio automatically invalidates stale video skip decisions.
 pub struct StateCache {
     entries: Mutex<HashMap<PathBuf, CachedSkip>>,
-    writer: Mutex<Option<BufWriter<File>>>,
+    writer: Mutex<BufWriter<File>>,
     fingerprint: String,
 }
 
@@ -31,8 +31,7 @@ impl StateCache {
         if path.exists() {
             let file = File::open(path)
                 .with_context(|| format!("无法打开状态缓存文件: {}", path.display()))?;
-            let reader = BufReader::new(file);
-            for line in reader.lines().map_while(Result::ok) {
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
                 if let Some((file_path, entry)) = parse_line(&line) {
                     map.insert(file_path, entry);
                 }
@@ -54,7 +53,7 @@ impl StateCache {
 
         Ok(Self {
             entries: Mutex::new(map),
-            writer: Mutex::new(Some(BufWriter::new(file))),
+            writer: Mutex::new(BufWriter::new(file)),
             fingerprint: fingerprint.into(),
         })
     }
@@ -96,24 +95,23 @@ impl StateCache {
         scope: &str,
         reason: &str,
     ) {
-        let entry = CachedSkip {
-            size,
-            mtime_secs,
-            fingerprint: scope.to_string(),
-            reason: reason.to_string(),
-        };
-
         {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-            entries.insert(path.to_path_buf(), entry);
+            entries.insert(
+                path.to_path_buf(),
+                CachedSkip {
+                    size,
+                    mtime_secs,
+                    fingerprint: scope.to_string(),
+                    reason: reason.to_string(),
+                },
+            );
         }
 
-        let mut writer_guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(writer) = writer_guard.as_mut() {
-            let line = format_line(path, size, mtime_secs, scope, reason);
-            if writeln!(writer, "{}", line).is_ok() {
-                let _ = writer.flush();
-            }
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let line = format_line(path, size, mtime_secs, scope, reason);
+        if writeln!(writer, "{}", line).is_ok() {
+            let _ = writer.flush();
         }
     }
 }
@@ -174,7 +172,6 @@ fn parse_line(line: &str) -> Option<(PathBuf, CachedSkip)> {
     let fourth = parts.next()?;
     let (fingerprint, reason_str) = match parts.next() {
         Some(fifth) => (unescape_field(fourth), fifth),
-        // Legacy 4-column state file: treat as unmatched fingerprint unless wildcard
         None => (String::new(), fourth),
     };
 
@@ -201,20 +198,29 @@ mod tests {
         let hevc_path = PathBuf::from("/mnt/nas/videos/already.mp4");
 
         {
-            let cache = StateCache::open_with_fingerprint(&state_path, "jetson-gst|x=42|m=15").unwrap();
+            let cache =
+                StateCache::open_with_fingerprint(&state_path, "jetson-gst|x=42|m=15").unwrap();
             assert_eq!(cache.len(), 0);
             cache.record_skip(&media_path, 12345, 1_700_000_000, "预估节省不足");
             cache.record_permanent_skip(&hevc_path, 999, 1_700_000_000, "已是H.265编码");
             assert_eq!(
-                cache.get_cached_skip(&media_path, 12345, 1_700_000_000).as_deref(),
+                cache
+                    .get_cached_skip(&media_path, 12345, 1_700_000_000)
+                    .as_deref(),
                 Some("预估节省不足")
             );
-            // Size or mtime change invalidates
-            assert!(cache.get_cached_skip(&media_path, 99999, 1_700_000_000).is_none());
-            assert!(cache.get_cached_skip(&media_path, 12345, 1_700_000_001).is_none());
+            assert!(
+                cache
+                    .get_cached_skip(&media_path, 99999, 1_700_000_000)
+                    .is_none()
+            );
+            assert!(
+                cache
+                    .get_cached_skip(&media_path, 12345, 1_700_000_001)
+                    .is_none()
+            );
         }
 
-        // Same fingerprint hits
         let reloaded_same =
             StateCache::open_with_fingerprint(&state_path, "jetson-gst|x=42|m=15").unwrap();
         assert_eq!(reloaded_same.len(), 2);
@@ -225,7 +231,6 @@ mod tests {
             Some("预估节省不足")
         );
 
-        // Changed fingerprint invalidates video skip, but keeps permanent already-HEVC skip
         let reloaded_new =
             StateCache::open_with_fingerprint(&state_path, "jetson-gst|x=40|m=10").unwrap();
         assert!(

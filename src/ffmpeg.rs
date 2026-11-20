@@ -72,24 +72,27 @@ impl VideoInfo {
 
     /// True if the source video uses HDR transfer characteristics (PQ / HLG).
     pub fn is_hdr(&self) -> bool {
-        self.color_transfer
-            .as_deref()
-            .map(|t| {
-                let lower = t.to_ascii_lowercase();
-                lower == "smpte2084" || lower == "arib-std-b67"
-            })
-            .unwrap_or(false)
+        self.color_transfer.as_deref().is_some_and(|t| {
+            t.eq_ignore_ascii_case("smpte2084") || t.eq_ignore_ascii_case("arib-std-b67")
+        })
     }
 
     /// True if the source pixel format is 10-bit or deeper.
     pub fn is_high_bit_depth(&self) -> bool {
-        self.pix_fmt
-            .as_deref()
-            .map(|p| {
-                let lower = p.to_ascii_lowercase();
-                lower.contains("10") || lower.contains("12") || lower.contains("16")
-            })
-            .unwrap_or(false)
+        self.pix_fmt.as_deref().is_some_and(|p| {
+            let lower = p.to_ascii_lowercase();
+            lower.contains("10") || lower.contains("12") || lower.contains("16")
+        })
+    }
+
+    /// True if pixel format is unknown or standard 4:2:0 (supported by HW NVDEC).
+    pub fn is_420_pix_fmt(&self) -> bool {
+        self.pix_fmt.as_deref().is_none_or(|fmt| {
+            matches!(
+                fmt.to_ascii_lowercase().as_str(),
+                "yuv420p" | "yuvj420p" | "nv12" | "yuv420p10le" | "p010le"
+            )
+        })
     }
 
     /// Effective video stream bitrate in bps, subtracting audio when only container bitrate is known.
@@ -107,7 +110,7 @@ impl VideoInfo {
         total_bps.saturating_sub(self.audio_bitrate)
     }
 
-    /// Bits per pixel per frame (BPP) — useful for identifying already heavily compressed sources.
+    /// Bits per pixel per frame (BPP) — identifies already heavily compressed sources.
     pub fn bits_per_pixel(&self, input_size: u64) -> f64 {
         let v_bps = self.effective_video_bitrate(input_size) as f64;
         let pixels_per_sec = self.width as f64 * self.height as f64 * self.fps.max(1.0);
@@ -120,28 +123,21 @@ impl VideoInfo {
 
     /// Whether source codec + pixel format is safely supported by desktop CUDA NVDEC zero-copy decode.
     pub fn is_nvdec_compatible(&self) -> bool {
-        let Some(codec) = self.codec_name.as_deref() else {
-            return false;
-        };
-        let codec_ok = matches!(
-            codec.to_ascii_lowercase().as_str(),
-            "h264" | "hevc" | "vp9" | "vp8" | "mpeg2video" | "mpeg4" | "vc1" | "av1" | "mjpeg"
-        );
-        if !codec_ok {
-            return false;
-        }
-        match self.pix_fmt.as_deref() {
-            None => true,
-            Some(fmt) => matches!(
-                fmt.to_ascii_lowercase().as_str(),
-                "yuv420p" | "yuvj420p" | "nv12" | "yuv420p10le" | "p010le"
-            ),
-        }
+        let codec_ok = self.codec_name.as_deref().is_some_and(|codec| {
+            matches!(
+                codec.to_ascii_lowercase().as_str(),
+                "h264" | "hevc" | "vp9" | "vp8" | "mpeg2video" | "mpeg4" | "vc1" | "av1" | "mjpeg"
+            )
+        });
+        codec_ok && self.is_420_pix_fmt()
     }
 
     /// Determine GStreamer zero-copy (demuxer, parser) pair if the container + codec + pixel format
     /// can go straight through `nvv4l2decoder -> nvvidconv -> nvv4l2h265enc` in NVMM memory.
     pub fn gst_zerocopy_elements(&self) -> Option<(&'static str, &'static str)> {
+        if !self.is_420_pix_fmt() {
+            return None;
+        }
         let fmt = self.format_name.as_deref()?.to_ascii_lowercase();
         let demux = if fmt.contains("mp4") || fmt.contains("mov") || fmt.contains("3gp") {
             "qtdemux"
@@ -162,17 +158,6 @@ impl VideoInfo {
             _ => return None,
         };
 
-        // Ensure pixel format is 4:2:0 (NVDEC on Jetson does not decode 4:2:2 / 4:4:4 / RGB).
-        if let Some(pix) = self.pix_fmt.as_deref() {
-            let p = pix.to_ascii_lowercase();
-            if !matches!(
-                p.as_str(),
-                "yuv420p" | "yuvj420p" | "nv12" | "yuv420p10le" | "p010le"
-            ) {
-                return None;
-            }
-        }
-
         Some((demux, parser))
     }
 }
@@ -181,11 +166,8 @@ impl VideoInfo {
 /// and low-bitrate audio bloat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioPlan {
-    /// Input has no audio stream.
     None,
-    /// Copy original audio stream untouched (zero quality loss, zero size bloat).
     Copy,
-    /// Transcode audio to AAC at the chosen bitrate (kbps).
     TranscodeAac(u32),
 }
 
@@ -193,10 +175,10 @@ impl AudioPlan {
     /// Decide whether to copy or transcode audio based on source stream properties and CLI bitrate.
     pub fn decide(info: &VideoInfo, requested_bitrate_kbps: u32) -> Self {
         if !info.has_audio {
-            return AudioPlan::None;
+            return Self::None;
         }
         if requested_bitrate_kbps == 0 {
-            return AudioPlan::Copy;
+            return Self::Copy;
         }
 
         // Adapt target bitrate to channel count so 5.1 surround isn't destroyed at 128kbps.
@@ -207,107 +189,122 @@ impl AudioPlan {
             _ => requested_bitrate_kbps.max(256),
         };
 
-        let mp4_compatible = info
-            .audio_codec
-            .as_deref()
-            .map(|c| {
-                matches!(
-                    c.to_ascii_lowercase().as_str(),
-                    "aac" | "mp3" | "ac3" | "eac3" | "opus"
-                )
-            })
-            .unwrap_or(false);
+        let mp4_compatible = info.audio_codec.as_deref().is_some_and(|c| {
+            matches!(
+                c.to_ascii_lowercase().as_str(),
+                "aac" | "mp3" | "ac3" | "eac3" | "opus"
+            )
+        });
 
         // If already MP4-compatible and within 15% of (or below!) target bitrate, copy directly.
         if mp4_compatible && info.audio_bitrate > 0 {
             let threshold_bps = (target_kbps as u64) * 1000 * 115 / 100;
             if info.audio_bitrate <= threshold_bps {
-                return AudioPlan::Copy;
+                return Self::Copy;
             }
         }
 
-        AudioPlan::TranscodeAac(target_kbps)
+        Self::TranscodeAac(target_kbps)
     }
 
     /// Estimated final audio bitrate in bits/sec for accurate video-budget accounting.
     pub fn estimated_bps(self, info: &VideoInfo) -> u64 {
         match self {
-            AudioPlan::None => 0,
-            AudioPlan::Copy => {
+            Self::None => 0,
+            Self::Copy => {
                 if info.audio_bitrate > 0 {
                     info.audio_bitrate
                 } else {
                     128_000
                 }
             }
-            AudioPlan::TranscodeAac(kbps) => (kbps as u64) * 1000,
+            Self::TranscodeAac(kbps) => (kbps as u64) * 1000,
         }
     }
 
     /// Append audio arguments to an FFmpeg command.
     pub fn append_ffmpeg_args(self, cmd: &mut Command) {
         match self {
-            AudioPlan::None => {
+            Self::None => {
                 cmd.arg("-an");
             }
-            AudioPlan::Copy => {
-                cmd.arg("-c:a").arg("copy");
+            Self::Copy => {
+                cmd.args(["-c:a", "copy"]);
             }
-            AudioPlan::TranscodeAac(kbps) => {
-                cmd.arg("-c:a")
-                    .arg("aac")
-                    .arg("-b:a")
-                    .arg(format!("{}k", kbps));
+            Self::TranscodeAac(kbps) => {
+                cmd.args(["-c:a", "aac", "-b:a", &format!("{}k", kbps)]);
             }
+        }
+    }
+}
+
+/// Perceptual quality metric filter supported by standard FFmpeg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityMetric {
+    Xpsnr,
+    Ssim,
+}
+
+impl QualityMetric {
+    pub fn from_capabilities(caps: &HardwareCapabilities) -> Option<Self> {
+        if caps.has_xpsnr {
+            Some(Self::Xpsnr)
+        } else if caps.has_ssim {
+            Some(Self::Ssim)
+        } else {
+            None
+        }
+    }
+
+    pub fn target(self, target_xpsnr: f64) -> f64 {
+        match self {
+            Self::Xpsnr => target_xpsnr,
+            Self::Ssim => 0.980,
+        }
+    }
+
+    /// Minimum score gain for a 4-point Q reduction before declaring a noise-floor knee.
+    pub fn knee_threshold(self) -> f64 {
+        match self {
+            Self::Xpsnr => 1.0,
+            Self::Ssim => 0.004,
+        }
+    }
+
+    pub fn format_score(self, score: f64) -> String {
+        match self {
+            Self::Xpsnr => format!("XPSNR={:.2}dB", score),
+            Self::Ssim => format!("SSIM={:.4}", score),
         }
     }
 }
 
 /// Summary of FFmpeg compiled-in encoders detected in a single probe.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct AvailableEncoders {
-    pub libx265: bool,
-    pub libx264: bool,
-    pub nvenc: bool,
-    pub nvmpi: bool,
-    pub qsv: bool,
-    pub vaapi: bool,
-    pub amf: bool,
-    pub videotoolbox: bool,
+struct AvailableEncoders {
+    libx265: bool,
+    libx264: bool,
+    nvenc: bool,
+    qsv: bool,
+    vaapi: bool,
+    amf: bool,
+    videotoolbox: bool,
 }
 
-/// Parse `ffmpeg -encoders` output once.
-pub fn parse_ffmpeg_encoders(encoders_stdout: &str) -> AvailableEncoders {
+fn parse_ffmpeg_encoders(encoders_stdout: &str) -> AvailableEncoders {
     let mut avail = AvailableEncoders::default();
     for line in encoders_stdout.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with('V') {
             continue;
         }
-        if trimmed.contains("libx265") {
-            avail.libx265 = true;
-        }
-        if trimmed.contains("libx264") {
-            avail.libx264 = true;
-        }
-        if trimmed.contains("hevc_nvenc") {
-            avail.nvenc = true;
-        }
-        if trimmed.contains("hevc_nvmpi") {
-            avail.nvmpi = true;
-        }
-        if trimmed.contains("hevc_qsv") {
-            avail.qsv = true;
-        }
-        if trimmed.contains("hevc_vaapi") {
-            avail.vaapi = true;
-        }
-        if trimmed.contains("hevc_amf") {
-            avail.amf = true;
-        }
-        if trimmed.contains("hevc_videotoolbox") {
-            avail.videotoolbox = true;
-        }
+        avail.libx265 |= trimmed.contains("libx265");
+        avail.libx264 |= trimmed.contains("libx264");
+        avail.nvenc |= trimmed.contains("hevc_nvenc");
+        avail.qsv |= trimmed.contains("hevc_qsv");
+        avail.vaapi |= trimmed.contains("hevc_vaapi");
+        avail.amf |= trimmed.contains("hevc_amf");
+        avail.videotoolbox |= trimmed.contains("hevc_videotoolbox");
     }
     avail
 }
@@ -337,17 +334,12 @@ fn query_ffmpeg_filters() -> (bool, bool) {
         return (false, false);
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut has_xpsnr = false;
-    let mut has_ssim = false;
+    let (mut has_xpsnr, mut has_ssim) = (false, false);
     for line in text.lines() {
-        let mut parts = line.split_whitespace();
-        let _flags = parts.next();
-        if let Some(name) = parts.next() {
-            if name == "xpsnr" {
-                has_xpsnr = true;
-            } else if name == "ssim" {
-                has_ssim = true;
-            }
+        match line.split_whitespace().nth(1) {
+            Some("xpsnr") => has_xpsnr = true,
+            Some("ssim") => has_ssim = true,
+            _ => {}
         }
     }
     (has_xpsnr, has_ssim)
@@ -357,28 +349,20 @@ fn probe_x265_10bit() -> bool {
     Command::new("ffmpeg")
         .args(["-hide_banner", "-h", "encoder=libx265"])
         .output()
-        .map(|o| {
+        .is_ok_and(|o| {
             o.status.success() && String::from_utf8_lossy(&o.stdout).contains("yuv420p10le")
         })
-        .unwrap_or(false)
 }
 
-/// Run a tiny 2-frame lavfi encode to verify that an FFmpeg hardware encoder
-/// actually initializes on real hardware (not just compiled in).
-fn probe_ffmpeg_hw_encode(extra_args: &[&str]) -> bool {
+/// Run a tiny 2-frame lavfi encode to verify an FFmpeg hardware encoder initializes at runtime.
+fn probe_ffmpeg_hw_encode(pre_args: &[&str], post_args: &[&str]) -> bool {
     let mut cmd = Command::new("ffmpeg");
-    cmd.args([
-        "-hide_banner",
-        "-v",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=c=black:s=256x256:d=0.07:r=30",
-    ]);
-    cmd.args(extra_args);
-    cmd.args(["-f", "null", "-"]);
-    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+    cmd.args(["-hide_banner", "-v", "error"])
+        .args(pre_args)
+        .args(["-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.07:r=30"])
+        .args(post_args)
+        .args(["-f", "null", "-"]);
+    cmd.output().is_ok_and(|o| o.status.success())
 }
 
 fn probe_gst_nvv4l2(ten_bit: bool) -> bool {
@@ -410,16 +394,14 @@ fn probe_gst_nvv4l2(ten_bit: bool) -> bool {
             "fakesink",
         ])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn probe_gst_element_exists(element: &str) -> bool {
     Command::new("gst-inspect-1.0")
         .arg(element)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 fn detect_nvidia_gpu_count() -> usize {
@@ -439,28 +421,145 @@ fn detect_nvidia_gpu_count() -> usize {
 }
 
 fn find_vaapi_device() -> Option<String> {
-    for idx in 128..=135 {
-        let candidate = format!("/dev/dri/renderD{}", idx);
-        if Path::new(&candidate).exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    (128..=135)
+        .map(|idx| format!("/dev/dri/renderD{}", idx))
+        .find(|p| Path::new(p).exists())
 }
 
-/// Check if running on NVIDIA Jetson (Tegra) platform.
-pub fn is_jetson_platform() -> bool {
-    if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        && release.contains("tegra")
-    {
-        return true;
-    }
-    Path::new("/dev/v4l2-nvenc").exists()
+fn is_jetson_platform() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease").is_ok_and(|r| r.contains("tegra"))
+        || Path::new("/dev/v4l2-nvenc").exists()
         || Path::new("/sys/devices/platform/17000000.gpu").exists()
 }
 
+fn probe_jetson_gst_caps(caps: &mut HardwareCapabilities) {
+    if probe_gst_nvv4l2(true) {
+        caps.jetson_gst_ok = true;
+        caps.jetson_gst_10bit = true;
+    } else if probe_gst_nvv4l2(false) {
+        caps.jetson_gst_ok = true;
+    }
+    if caps.jetson_gst_ok {
+        caps.jetson_gst_decoder =
+            probe_gst_element_exists("nvv4l2decoder") && probe_gst_element_exists("matroskamux");
+        caps.jetson_gst_audio_mux = probe_gst_element_exists("mp4mux")
+            && probe_gst_element_exists("aacparse")
+            && probe_gst_element_exists("avenc_aac");
+    }
+}
+
+fn probe_nvenc_caps(caps: &mut HardwareCapabilities) {
+    let probe_nvenc = |extra: &[&str]| {
+        let mut args = vec!["-c:v", "hevc_nvenc", "-rc", "vbr", "-cq", "28", "-b:v", "0"];
+        args.extend_from_slice(extra);
+        probe_ffmpeg_hw_encode(&[], &args)
+    };
+
+    // Probe full modern NVENC feature set first (Turing/Ampere/Ada/Blackwell).
+    if probe_nvenc(&[
+        "-preset",
+        "p4",
+        "-tune",
+        "hq",
+        "-profile:v",
+        "main10",
+        "-pix_fmt",
+        "p010le",
+        "-bf",
+        "4",
+        "-b_ref_mode",
+        "middle",
+        "-multipass",
+        "qres",
+    ]) {
+        caps.nvenc_ok = true;
+        caps.nvenc_10bit = true;
+        caps.nvenc_bframes = true;
+        caps.nvenc_multipass = true;
+        caps.nvenc_uhq = probe_nvenc(&["-preset", "p6", "-tune", "uhq"]);
+        caps.nvenc_gpu_count = detect_nvidia_gpu_count();
+    } else if probe_nvenc(&["-preset", "p4"]) {
+        // Older GPU (e.g. Pascal) — verify sub-features individually.
+        caps.nvenc_ok = true;
+        caps.nvenc_10bit = probe_nvenc(&["-profile:v", "main10", "-pix_fmt", "p010le"]);
+        caps.nvenc_bframes = probe_nvenc(&["-bf", "4", "-b_ref_mode", "middle"]);
+        caps.nvenc_multipass = probe_nvenc(&["-multipass", "qres"]);
+        caps.nvenc_gpu_count = detect_nvidia_gpu_count();
+    }
+}
+
+fn probe_qsv_caps(caps: &mut HardwareCapabilities) {
+    caps.qsv_ok = probe_ffmpeg_hw_encode(
+        &[],
+        &[
+            "-c:v",
+            "hevc_qsv",
+            "-global_quality",
+            "26",
+            "-look_ahead",
+            "0",
+        ],
+    );
+}
+
+fn probe_videotoolbox_caps(caps: &mut HardwareCapabilities) {
+    caps.videotoolbox_ok =
+        probe_ffmpeg_hw_encode(&[], &["-c:v", "hevc_videotoolbox", "-q:v", "65"]);
+}
+
+fn probe_amf_caps(caps: &mut HardwareCapabilities) {
+    caps.amf_ok = probe_ffmpeg_hw_encode(
+        &[],
+        &[
+            "-c:v", "hevc_amf", "-rc", "cqp", "-qp_i", "26", "-qp_p", "26",
+        ],
+    );
+}
+
+fn probe_vaapi_caps(caps: &mut HardwareCapabilities) {
+    if let Some(dev) = find_vaapi_device()
+        && probe_ffmpeg_hw_encode(
+            &["-vaapi_device", &dev],
+            &[
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "hevc_vaapi",
+                "-rc_mode",
+                "CQP",
+                "-qp",
+                "26",
+            ],
+        )
+    {
+        caps.vaapi_ok = true;
+        caps.vaapi_device = Some(dev);
+    }
+}
+
+/// Parse CLI `--encoder` string (`None` represents `"auto"`).
+pub fn parse_encoder_arg(s: &str) -> Result<Option<EncoderType>> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(None),
+        "cpu" => Ok(Some(EncoderType::Cpu)),
+        "gpu" | "nvenc" => Ok(Some(EncoderType::Gpu)),
+        "jetson" | "jetson-gst" | "gstreamer" | "v4l2" => Ok(Some(EncoderType::JetsonGst)),
+        "qsv" => Ok(Some(EncoderType::Qsv)),
+        "vaapi" => Ok(Some(EncoderType::Vaapi)),
+        "amf" => Ok(Some(EncoderType::Amf)),
+        "videotoolbox" | "vt" => Ok(Some(EncoderType::VideoToolbox)),
+        _ => anyhow::bail!(
+            "无效的编码器类型: {}。可选: auto, cpu, gpu, jetson, jetson-gst, qsv, vaapi, amf, videotoolbox",
+            s
+        ),
+    }
+}
+
 /// Perform real runtime hardware capability probing once at startup.
-pub fn detect_hardware_capabilities() -> Result<HardwareCapabilities> {
+/// When `target` is explicit (`Some(...)`), probes only the requested backend
+/// (avoiding unnecessary probes on `--encoder cpu` and ensuring `--encoder vaapi/qsv`
+/// works on multi-GPU hosts). When `None` (`auto`), probes in priority order.
+pub fn detect_hardware_capabilities(target: Option<EncoderType>) -> Result<HardwareCapabilities> {
     let enc = query_ffmpeg_encoders()?;
     let (has_xpsnr, has_ssim) = query_ffmpeg_filters();
     let x265_10bit = enc.libx265 && probe_x265_10bit();
@@ -474,195 +573,33 @@ pub fn detect_hardware_capabilities() -> Result<HardwareCapabilities> {
         ..Default::default()
     };
 
-    let on_jetson = is_jetson_platform();
-
-    if on_jetson {
-        // Prefer official JetPack GStreamer nvv4l2h265enc (zero custom FFmpeg required!).
-        if probe_gst_nvv4l2(true) {
-            caps.jetson_gst_ok = true;
-            caps.jetson_gst_10bit = true;
-        } else if probe_gst_nvv4l2(false) {
-            caps.jetson_gst_ok = true;
-            caps.jetson_gst_10bit = false;
-        }
-        if caps.jetson_gst_ok {
-            caps.jetson_gst_decoder = probe_gst_element_exists("nvv4l2decoder")
-                && probe_gst_element_exists("matroskamux");
-            caps.jetson_gst_audio_mux = probe_gst_element_exists("mp4mux")
-                && probe_gst_element_exists("aacparse")
-                && probe_gst_element_exists("avenc_aac");
-        }
-        if enc.nvmpi {
-            caps.jetson_nvmpi_ok = probe_ffmpeg_hw_encode(&["-c:v", "hevc_nvmpi", "-b:v", "1000k"]);
-        }
-        log_debug(&format!("Jetson硬件探测结果: {:?}", caps));
-        return Ok(caps);
-    }
-
-    // Non-Jetson desktop / server platforms: runtime-verify available hardware encoders.
-    if enc.nvenc {
-        // Probe full modern NVENC feature set first (Turing/Ampere/Ada/Blackwell).
-        if probe_ffmpeg_hw_encode(&[
-            "-c:v",
-            "hevc_nvenc",
-            "-preset",
-            "p4",
-            "-tune",
-            "hq",
-            "-rc",
-            "vbr",
-            "-cq",
-            "28",
-            "-b:v",
-            "0",
-            "-profile:v",
-            "main10",
-            "-pix_fmt",
-            "p010le",
-            "-bf",
-            "4",
-            "-b_ref_mode",
-            "middle",
-            "-multipass",
-            "qres",
-        ]) {
-            caps.nvenc_ok = true;
-            caps.nvenc_10bit = true;
-            caps.nvenc_bframes = true;
-            caps.nvenc_multipass = true;
-            caps.nvenc_uhq = probe_ffmpeg_hw_encode(&[
-                "-c:v",
-                "hevc_nvenc",
-                "-preset",
-                "p6",
-                "-tune",
-                "uhq",
-                "-rc",
-                "vbr",
-                "-cq",
-                "28",
-                "-b:v",
-                "0",
-            ]);
-            caps.nvenc_gpu_count = detect_nvidia_gpu_count();
-        } else if probe_ffmpeg_hw_encode(&[
-            "-c:v",
-            "hevc_nvenc",
-            "-preset",
-            "p4",
-            "-rc",
-            "vbr",
-            "-cq",
-            "28",
-            "-b:v",
-            "0",
-        ]) {
-            // Older GPU (e.g. Pascal) — verify sub-features individually.
-            caps.nvenc_ok = true;
-            caps.nvenc_10bit = probe_ffmpeg_hw_encode(&[
-                "-c:v",
-                "hevc_nvenc",
-                "-profile:v",
-                "main10",
-                "-pix_fmt",
-                "p010le",
-                "-rc",
-                "vbr",
-                "-cq",
-                "28",
-                "-b:v",
-                "0",
-            ]);
-            caps.nvenc_bframes = probe_ffmpeg_hw_encode(&[
-                "-c:v",
-                "hevc_nvenc",
-                "-bf",
-                "4",
-                "-b_ref_mode",
-                "middle",
-                "-rc",
-                "vbr",
-                "-cq",
-                "28",
-                "-b:v",
-                "0",
-            ]);
-            caps.nvenc_multipass = probe_ffmpeg_hw_encode(&[
-                "-c:v",
-                "hevc_nvenc",
-                "-multipass",
-                "qres",
-                "-rc",
-                "vbr",
-                "-cq",
-                "28",
-                "-b:v",
-                "0",
-            ]);
-            caps.nvenc_gpu_count = detect_nvidia_gpu_count();
-        }
-    }
-
-    if !caps.nvenc_ok && enc.qsv {
-        caps.qsv_ok = probe_ffmpeg_hw_encode(&[
-            "-c:v",
-            "hevc_qsv",
-            "-global_quality",
-            "26",
-            "-look_ahead",
-            "0",
-        ]);
-    }
-
-    if !caps.nvenc_ok && !caps.qsv_ok && enc.videotoolbox {
-        caps.videotoolbox_ok = probe_ffmpeg_hw_encode(&["-c:v", "hevc_videotoolbox", "-q:v", "65"]);
-    }
-
-    if !caps.nvenc_ok && !caps.qsv_ok && !caps.videotoolbox_ok && enc.amf {
-        caps.amf_ok = probe_ffmpeg_hw_encode(&[
-            "-c:v",
-            "hevc_amf",
-            "-rc",
-            "cqp",
-            "-qp_i",
-            "26",
-            "-qp_p",
-            "26",
-        ]);
-    }
-
-    if !caps.nvenc_ok && !caps.qsv_ok && !caps.videotoolbox_ok && !caps.amf_ok && enc.vaapi
-        && let Some(dev) = find_vaapi_device()
-    {
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-v",
-                "error",
-                "-vaapi_device",
-                &dev,
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=black:s=256x256:d=0.07:r=30",
-                "-vf",
-                "format=nv12,hwupload",
-                "-c:v",
-                "hevc_vaapi",
-                "-rc_mode",
-                "CQP",
-                "-qp",
-                "26",
-                "-f",
-                "null",
-                "-",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            caps.vaapi_ok = true;
-            caps.vaapi_device = Some(dev);
+    match target {
+        Some(EncoderType::Cpu) => {}
+        Some(EncoderType::JetsonGst) => probe_jetson_gst_caps(&mut caps),
+        Some(EncoderType::Gpu) if enc.nvenc => probe_nvenc_caps(&mut caps),
+        Some(EncoderType::Qsv) if enc.qsv => probe_qsv_caps(&mut caps),
+        Some(EncoderType::Vaapi) if enc.vaapi => probe_vaapi_caps(&mut caps),
+        Some(EncoderType::Amf) if enc.amf => probe_amf_caps(&mut caps),
+        Some(EncoderType::VideoToolbox) if enc.videotoolbox => probe_videotoolbox_caps(&mut caps),
+        Some(_) => {}
+        None if is_jetson_platform() => probe_jetson_gst_caps(&mut caps),
+        None => {
+            if enc.nvenc {
+                probe_nvenc_caps(&mut caps);
+            }
+            if !caps.nvenc_ok && enc.qsv {
+                probe_qsv_caps(&mut caps);
+            }
+            if !caps.nvenc_ok && !caps.qsv_ok && enc.videotoolbox {
+                probe_videotoolbox_caps(&mut caps);
+            }
+            if !caps.nvenc_ok && !caps.qsv_ok && !caps.videotoolbox_ok && enc.amf {
+                probe_amf_caps(&mut caps);
+            }
+            if !caps.nvenc_ok && !caps.qsv_ok && !caps.videotoolbox_ok && !caps.amf_ok && enc.vaapi
+            {
+                probe_vaapi_caps(&mut caps);
+            }
         }
     }
 
@@ -670,59 +607,32 @@ pub fn detect_hardware_capabilities() -> Result<HardwareCapabilities> {
     Ok(caps)
 }
 
-/// Resolve CLI `--encoder` string against runtime-verified hardware capabilities.
-pub fn resolve_encoder_type(s: &str, caps: &HardwareCapabilities) -> Result<EncoderType> {
-    match s.to_lowercase().as_str() {
-        "cpu" => Ok(EncoderType::Cpu),
-        "gpu" | "nvenc" => Ok(EncoderType::Gpu),
-        "jetson" => {
-            if caps.jetson_gst_ok {
-                Ok(EncoderType::JetsonGst)
-            } else if caps.jetson_nvmpi_ok {
-                log_info("注意: 未检测到官方 GStreamer nvv4l2h265enc，回退到兼容模式 hevc_nvmpi");
-                Ok(EncoderType::JetsonNvmpi)
-            } else {
-                Ok(EncoderType::JetsonGst)
-            }
-        }
-        "jetson-gst" | "gstreamer" | "v4l2" => Ok(EncoderType::JetsonGst),
-        "jetson-nvmpi" | "nvmpi" => Ok(EncoderType::JetsonNvmpi),
-        "qsv" => Ok(EncoderType::Qsv),
-        "vaapi" => Ok(EncoderType::Vaapi),
-        "amf" => Ok(EncoderType::Amf),
-        "videotoolbox" | "vt" => Ok(EncoderType::VideoToolbox),
-        "auto" => {
-            if caps.jetson_gst_ok {
-                log_info("自动选择: Jetson 官方 GStreamer nvv4l2h265enc (零自编译FFmpeg)");
-                Ok(EncoderType::JetsonGst)
-            } else if caps.nvenc_ok {
-                log_info("自动选择: NVIDIA GPU NVENC (hevc_nvenc)");
-                Ok(EncoderType::Gpu)
-            } else if caps.qsv_ok {
-                log_info("自动选择: Intel QSV (hevc_qsv)");
-                Ok(EncoderType::Qsv)
-            } else if caps.videotoolbox_ok {
-                log_info("自动选择: Apple VideoToolbox (hevc_videotoolbox)");
-                Ok(EncoderType::VideoToolbox)
-            } else if caps.amf_ok {
-                log_info("自动选择: AMD AMF (hevc_amf)");
-                Ok(EncoderType::Amf)
-            } else if caps.vaapi_ok {
-                log_info("自动选择: Linux VA-API (hevc_vaapi)");
-                Ok(EncoderType::Vaapi)
-            } else if caps.jetson_nvmpi_ok {
-                log_info("自动选择: Jetson NVMPI (hevc_nvmpi, 兼容模式)");
-                Ok(EncoderType::JetsonNvmpi)
-            } else {
-                log_info("注意: 未检测到可用硬件编码器，使用 CPU (libx265)");
-                Ok(EncoderType::Cpu)
-            }
-        }
-        _ => anyhow::bail!(
-            "无效的编码器类型: {}。可选: auto, cpu, gpu, jetson, jetson-gst, nvmpi, qsv, vaapi, amf, videotoolbox",
-            s
-        ),
+/// Resolve the active `EncoderType` from requested CLI target and runtime capabilities.
+pub fn resolve_encoder_type(
+    target: Option<EncoderType>,
+    caps: &HardwareCapabilities,
+) -> EncoderType {
+    if let Some(explicit) = target {
+        return explicit;
     }
+    let chosen = if caps.jetson_gst_ok {
+        EncoderType::JetsonGst
+    } else if caps.nvenc_ok {
+        EncoderType::Gpu
+    } else if caps.qsv_ok {
+        EncoderType::Qsv
+    } else if caps.videotoolbox_ok {
+        EncoderType::VideoToolbox
+    } else if caps.amf_ok {
+        EncoderType::Amf
+    } else if caps.vaapi_ok {
+        EncoderType::Vaapi
+    } else {
+        log_info("注意: 未检测到可用硬件编码器，使用 CPU (libx265)");
+        return EncoderType::Cpu;
+    };
+    log_info(&format!("自动选择: {}", chosen.display_name()));
+    chosen
 }
 
 /// Verify FFmpeg and the selected encoder backend are usable at runtime.
@@ -736,17 +646,14 @@ pub fn check_ffmpeg(encoder_type: EncoderType, caps: &HardwareCapabilities) -> R
         anyhow::bail!("FFmpeg执行失败");
     }
 
-    let version = String::from_utf8_lossy(&output.stdout);
-    if let Some(line) = version.lines().next() {
+    if let Some(line) = String::from_utf8_lossy(&output.stdout).lines().next() {
         log_info(&format!("检测到: {}", line));
     }
 
-    let metric_str = if caps.has_xpsnr {
-        "XPSNR (感知加权)"
-    } else if caps.has_ssim {
-        "SSIM (结构相似)"
-    } else {
-        "仅码率估算"
+    let metric_str = match QualityMetric::from_capabilities(caps) {
+        Some(QualityMetric::Xpsnr) => "XPSNR (感知加权)",
+        Some(QualityMetric::Ssim) => "SSIM (结构相似)",
+        None => "仅码率估算",
     };
     log_info(&format!("感知质量评估引擎: {}", metric_str));
 
@@ -784,38 +691,20 @@ pub fn check_ffmpeg(encoder_type: EncoderType, caps: &HardwareCapabilities) -> R
                 caps.jetson_gst_10bit, caps.jetson_gst_decoder
             ));
         }
-        EncoderType::JetsonNvmpi => {
-            if !caps.jetson_nvmpi_ok {
-                anyhow::bail!("FFmpeg未提供可用的hevc_nvmpi编码器");
-            }
-            log_info("✓ Jetson hevc_nvmpi 可用 (建议优先使用官方 jetson-gst)");
-        }
-        EncoderType::Qsv => {
-            if !caps.qsv_ok {
-                anyhow::bail!("Intel QSV (hevc_qsv) 初始化失败");
-            }
-            log_info("✓ Intel QSV (hevc_qsv) 可用");
-        }
-        EncoderType::Vaapi => {
-            if !caps.vaapi_ok {
-                anyhow::bail!("Linux VA-API (hevc_vaapi) 初始化失败");
-            }
-            log_info(&format!(
-                "✓ VA-API (hevc_vaapi) 可用 (设备: {})",
-                caps.vaapi_device.as_deref().unwrap_or("default")
-            ));
-        }
-        EncoderType::Amf => {
-            if !caps.amf_ok {
-                anyhow::bail!("AMD AMF (hevc_amf) 初始化失败");
-            }
-            log_info("✓ AMD AMF (hevc_amf) 可用");
+        EncoderType::Qsv if caps.qsv_ok => log_info("✓ Intel QSV (hevc_qsv) 可用"),
+        EncoderType::Qsv => anyhow::bail!("Intel QSV (hevc_qsv) 初始化失败"),
+        EncoderType::Vaapi if caps.vaapi_ok => log_info(&format!(
+            "✓ VA-API (hevc_vaapi) 可用 (设备: {})",
+            caps.vaapi_device.as_deref().unwrap_or("default")
+        )),
+        EncoderType::Vaapi => anyhow::bail!("Linux VA-API (hevc_vaapi) 初始化失败"),
+        EncoderType::Amf if caps.amf_ok => log_info("✓ AMD AMF (hevc_amf) 可用"),
+        EncoderType::Amf => anyhow::bail!("AMD AMF (hevc_amf) 初始化失败"),
+        EncoderType::VideoToolbox if caps.videotoolbox_ok => {
+            log_info("✓ Apple VideoToolbox (hevc_videotoolbox) 可用");
         }
         EncoderType::VideoToolbox => {
-            if !caps.videotoolbox_ok {
-                anyhow::bail!("Apple VideoToolbox (hevc_videotoolbox) 初始化失败");
-            }
-            log_info("✓ Apple VideoToolbox (hevc_videotoolbox) 可用");
+            anyhow::bail!("Apple VideoToolbox (hevc_videotoolbox) 初始化失败")
         }
     }
 
@@ -838,15 +727,60 @@ pub fn parse_fps_fraction(raw: &str) -> Option<f64> {
     } else {
         trimmed.parse::<f64>().ok()?
     };
-    if val.is_finite() && (1.0..=240.0).contains(&val) {
-        Some(val)
-    } else {
-        None
+    (val.is_finite() && (1.0..=240.0).contains(&val)).then_some(val)
+}
+
+#[derive(Default)]
+struct StreamAcc {
+    codec_type: Option<String>,
+    codec: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    pix_fmt: Option<String>,
+    bitrate: Option<u64>,
+    avg_fps: Option<f64>,
+    r_fps: Option<f64>,
+    color_transfer: Option<String>,
+    color_primaries: Option<String>,
+    color_space: Option<String>,
+    channels: Option<u32>,
+    rotation: Option<i32>,
+}
+
+impl StreamAcc {
+    fn flush_into(self, info: &mut VideoInfo, seen_video: &mut bool, seen_audio: &mut bool) {
+        match self.codec_type.as_deref() {
+            Some("video") if !*seen_video => {
+                *seen_video = true;
+                info.codec_name = self.codec;
+                if let Some(w) = self.width {
+                    info.width = w;
+                }
+                if let Some(h) = self.height {
+                    info.height = h;
+                }
+                info.pix_fmt = self.pix_fmt;
+                info.video_bitrate = self.bitrate.unwrap_or(0);
+                info.fps = self.avg_fps.or(self.r_fps).unwrap_or(30.0);
+                info.color_transfer = self.color_transfer;
+                info.color_primaries = self.color_primaries;
+                info.color_space = self.color_space;
+                info.rotation = self.rotation.unwrap_or(0);
+            }
+            Some("audio") if !*seen_audio => {
+                *seen_audio = true;
+                info.has_audio = true;
+                info.audio_codec = self.codec;
+                info.audio_bitrate = self.bitrate.unwrap_or(0);
+                info.audio_channels = self.channels.unwrap_or(2);
+            }
+            _ => {}
+        }
     }
 }
 
 /// Parse `ffprobe -of default=noprint_wrappers=0` sectioned output containing
-/// `[STREAM]` blocks (video + audio) and `[FORMAT]` block robustly.
+/// `[STREAM]` blocks (video + audio) and `[FORMAT]` block.
 pub fn parse_ffprobe_sections(output: &str) -> VideoInfo {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Section {
@@ -858,120 +792,37 @@ pub fn parse_ffprobe_sections(output: &str) -> VideoInfo {
 
     let mut info = VideoInfo::default();
     let mut section = Section::None;
-    let mut cur_codec_type: Option<String> = None;
-    let mut seen_video = false;
-    let mut seen_audio = false;
+    let mut acc = StreamAcc::default();
+    let (mut seen_video, mut seen_audio) = (false, false);
 
-    // Temporary fields for current [STREAM]
-    let mut s_codec: Option<String> = None;
-    let mut s_width: Option<u32> = None;
-    let mut s_height: Option<u32> = None;
-    let mut s_pix_fmt: Option<String> = None;
-    let mut s_bitrate: Option<u64> = None;
-    let mut s_avg_fps: Option<f64> = None;
-    let mut s_r_fps: Option<f64> = None;
-    let mut s_color_transfer: Option<String> = None;
-    let mut s_color_primaries: Option<String> = None;
-    let mut s_color_space: Option<String> = None;
-    let mut s_channels: Option<u32> = None;
-    let mut s_rotation: Option<i32> = None;
-
-    let flush_stream = |info: &mut VideoInfo,
-                        seen_video: &mut bool,
-                        seen_audio: &mut bool,
-                        cur_codec_type: &mut Option<String>,
-                        s_codec: &mut Option<String>,
-                        s_width: &mut Option<u32>,
-                        s_height: &mut Option<u32>,
-                        s_pix_fmt: &mut Option<String>,
-                        s_bitrate: &mut Option<u64>,
-                        s_avg_fps: &mut Option<f64>,
-                        s_r_fps: &mut Option<f64>,
-                        s_color_transfer: &mut Option<String>,
-                        s_color_primaries: &mut Option<String>,
-                        s_color_space: &mut Option<String>,
-                        s_channels: &mut Option<u32>,
-                        s_rotation: &mut Option<i32>| {
-        match cur_codec_type.as_deref() {
-            Some("video") if !*seen_video => {
-                *seen_video = true;
-                info.codec_name = s_codec.take();
-                if let Some(w) = s_width.take() {
-                    info.width = w;
-                }
-                if let Some(h) = s_height.take() {
-                    info.height = h;
-                }
-                info.pix_fmt = s_pix_fmt.take();
-                info.video_bitrate = s_bitrate.take().unwrap_or(0);
-                info.fps = s_avg_fps.take().or(s_r_fps.take()).unwrap_or(30.0);
-                info.color_transfer = s_color_transfer.take();
-                info.color_primaries = s_color_primaries.take();
-                info.color_space = s_color_space.take();
-                info.rotation = s_rotation.take().unwrap_or(0);
+    for line in output.lines().map(str::trim) {
+        match line {
+            "[STREAM]" => {
+                section = Section::Stream;
+                continue;
             }
-            Some("audio") if !*seen_audio => {
-                *seen_audio = true;
-                info.has_audio = true;
-                info.audio_codec = s_codec.take();
-                info.audio_bitrate = s_bitrate.take().unwrap_or(0);
-                info.audio_channels = s_channels.take().unwrap_or(2);
+            "[/STREAM]" => {
+                std::mem::take(&mut acc).flush_into(&mut info, &mut seen_video, &mut seen_audio);
+                section = Section::None;
+                continue;
+            }
+            "[SIDE_DATA]" => {
+                section = Section::SideData;
+                continue;
+            }
+            "[/SIDE_DATA]" => {
+                section = Section::Stream;
+                continue;
+            }
+            "[FORMAT]" => {
+                section = Section::Format;
+                continue;
+            }
+            "[/FORMAT]" => {
+                section = Section::None;
+                continue;
             }
             _ => {}
-        }
-        *cur_codec_type = None;
-        *s_codec = None;
-        *s_width = None;
-        *s_height = None;
-        *s_pix_fmt = None;
-        *s_bitrate = None;
-        *s_avg_fps = None;
-        *s_r_fps = None;
-        *s_color_transfer = None;
-        *s_color_primaries = None;
-        *s_color_space = None;
-        *s_channels = None;
-        *s_rotation = None;
-    };
-
-    for raw_line in output.lines() {
-        let line = raw_line.trim();
-        if line == "[STREAM]" {
-            section = Section::Stream;
-            continue;
-        } else if line == "[/STREAM]" {
-            flush_stream(
-                &mut info,
-                &mut seen_video,
-                &mut seen_audio,
-                &mut cur_codec_type,
-                &mut s_codec,
-                &mut s_width,
-                &mut s_height,
-                &mut s_pix_fmt,
-                &mut s_bitrate,
-                &mut s_avg_fps,
-                &mut s_r_fps,
-                &mut s_color_transfer,
-                &mut s_color_primaries,
-                &mut s_color_space,
-                &mut s_channels,
-                &mut s_rotation,
-            );
-            section = Section::None;
-            continue;
-        } else if line == "[SIDE_DATA]" {
-            section = Section::SideData;
-            continue;
-        } else if line == "[/SIDE_DATA]" {
-            section = Section::Stream;
-            continue;
-        } else if line == "[FORMAT]" {
-            section = Section::Format;
-            continue;
-        } else if line == "[/FORMAT]" {
-            section = Section::None;
-            continue;
         }
 
         let Some((key, raw_val)) = line.split_once('=') else {
@@ -984,30 +835,24 @@ pub fn parse_ffprobe_sections(output: &str) -> VideoInfo {
 
         match section {
             Section::Stream => match key.trim() {
-                "codec_type" => cur_codec_type = Some(val.to_ascii_lowercase()),
-                "codec_name" => s_codec = Some(val.to_string()),
-                "width" => s_width = val.parse().ok(),
-                "height" => s_height = val.parse().ok(),
-                "pix_fmt" => s_pix_fmt = Some(val.to_string()),
-                "bit_rate" => s_bitrate = val.parse().ok(),
-                "avg_frame_rate" => s_avg_fps = parse_fps_fraction(val),
-                "r_frame_rate" => s_r_fps = parse_fps_fraction(val),
-                "color_transfer" => s_color_transfer = Some(val.to_string()),
-                "color_primaries" => s_color_primaries = Some(val.to_string()),
-                "color_space" => s_color_space = Some(val.to_string()),
-                "channels" => s_channels = val.parse().ok(),
-                "TAG:rotate" => {
-                    if let Ok(r) = val.parse::<i32>() {
-                        s_rotation = Some(r);
-                    }
-                }
+                "codec_type" => acc.codec_type = Some(val.to_ascii_lowercase()),
+                "codec_name" => acc.codec = Some(val.to_string()),
+                "width" => acc.width = val.parse().ok(),
+                "height" => acc.height = val.parse().ok(),
+                "pix_fmt" => acc.pix_fmt = Some(val.to_string()),
+                "bit_rate" => acc.bitrate = val.parse().ok(),
+                "avg_frame_rate" => acc.avg_fps = parse_fps_fraction(val),
+                "r_frame_rate" => acc.r_fps = parse_fps_fraction(val),
+                "color_transfer" => acc.color_transfer = Some(val.to_string()),
+                "color_primaries" => acc.color_primaries = Some(val.to_string()),
+                "color_space" => acc.color_space = Some(val.to_string()),
+                "channels" => acc.channels = val.parse().ok(),
+                "TAG:rotate" => acc.rotation = val.parse().ok(),
                 _ => {}
             },
-            Section::SideData => {
-                if key.trim() == "rotation"
-                    && let Ok(r) = val.parse::<f64>()
-                {
-                    s_rotation = Some(r.round() as i32);
+            Section::SideData if key.trim() == "rotation" => {
+                if let Ok(r) = val.parse::<f64>() {
+                    acc.rotation = Some(r.round() as i32);
                 }
             }
             Section::Format => match key.trim() {
@@ -1019,201 +864,121 @@ pub fn parse_ffprobe_sections(output: &str) -> VideoInfo {
                     }
                 }
                 "bit_rate" => {
-                    if let Ok(b) = val.parse::<u64>() {
+                    if let Ok(b) = val.parse() {
                         info.bitrate = b;
                     }
                 }
-                "format_name" => {
-                    info.format_name = Some(val.to_string());
-                }
+                "format_name" => info.format_name = Some(val.to_string()),
                 _ => {}
             },
-            Section::None => {}
-        }
-    }
-
-    // Backwards-compatible fallback for wrapperless key=value lines (e.g., older tests)
-    if !seen_video && info.codec_name.is_none() {
-        for raw_line in output.lines() {
-            let Some((key, raw_val)) = raw_line.split_once('=') else {
-                continue;
-            };
-            let val = raw_val.trim();
-            if val.is_empty() || val.eq_ignore_ascii_case("N/A") {
-                continue;
-            }
-            match key.trim() {
-                "codec_name" if info.codec_name.is_none() => info.codec_name = Some(val.to_string()),
-                "width" => {
-                    if let Ok(w) = val.parse() {
-                        info.width = w;
-                    }
-                }
-                "height" => {
-                    if let Ok(h) = val.parse() {
-                        info.height = h;
-                    }
-                }
-                "pix_fmt" if info.pix_fmt.is_none() => info.pix_fmt = Some(val.to_string()),
-                "duration" => {
-                    if let Ok(d) = val.parse::<f64>() {
-                        info.duration = d;
-                    }
-                }
-                "bit_rate" => {
-                    if let Ok(b) = val.parse::<u64>() {
-                        info.bitrate = b;
-                    }
-                }
-                _ => {}
-            }
+            _ => {}
         }
     }
 
     info
 }
 
+fn run_ffprobe(path: &Path, args: &[&str], context_msg: &str) -> Result<String> {
+    let mut cmd = Command::new("ffprobe");
+    cmd.args(["-v", "error"]).args(args).arg(path);
+    let output = run_command_cancellable(&mut cmd, context_msg)?;
+    if !output.status.success() {
+        anyhow::bail!("{}", context_msg);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Probe video, primary audio, and container metadata in a single `ffprobe` call.
 pub fn get_video_info(path: &Path) -> Result<VideoInfo> {
-    let mut cmd = Command::new("ffprobe");
-    cmd.args([
-        "-v",
-        "error",
-        "-show_entries",
-        "stream=codec_type,codec_name,width,height,pix_fmt,bit_rate,avg_frame_rate,r_frame_rate,color_transfer,color_primaries,color_space,channels:stream_tags=rotate:stream_side_data=rotation:format=duration,bit_rate,format_name",
-        "-of",
-        "default=noprint_wrappers=0",
-    ])
-    .arg(path);
-
-    let output = run_command_cancellable(&mut cmd, "执行ffprobe失败")?;
-    if !output.status.success() {
-        anyhow::bail!("ffprobe执行失败");
-    }
-
-    let info_text = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_ffprobe_sections(&info_text))
+    let stdout = run_ffprobe(
+        path,
+        &[
+            "-show_entries",
+            "stream=codec_type,codec_name,width,height,pix_fmt,bit_rate,avg_frame_rate,r_frame_rate,color_transfer,color_primaries,color_space,channels:stream_tags=rotate:stream_side_data=rotation:format=duration,bit_rate,format_name",
+            "-of",
+            "default=noprint_wrappers=0",
+        ],
+        "执行ffprobe失败",
+    )?;
+    Ok(parse_ffprobe_sections(&stdout))
 }
 
 /// Probe real duration (seconds) and verify a valid video stream exists.
 pub fn probe_output_integrity(path: &Path) -> Option<f64> {
-    let mut cmd = Command::new("ffprobe");
-    cmd.args([
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=codec_type:format=duration",
-        "-of",
-        "default=noprint_wrappers=1",
-    ])
-    .arg(path);
+    let text = run_ffprobe(
+        path,
+        &[
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_type:format=duration",
+            "-of",
+            "default=noprint_wrappers=1",
+        ],
+        "校验输出视频完整性失败",
+    )
+    .ok()?;
 
-    let output = run_command_cancellable(&mut cmd, "校验输出视频完整性失败").ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
     let mut has_video = false;
     let mut duration = None;
     for line in text.lines() {
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        match k.trim() {
-            "codec_type" if v.trim() == "video" => has_video = true,
-            "duration" => {
-                if let Ok(d) = v.trim().parse::<f64>()
-                    && d > 0.0
-                {
-                    duration = Some(d);
-                }
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim() {
+                "codec_type" if v.trim() == "video" => has_video = true,
+                "duration" => duration = v.trim().parse::<f64>().ok().filter(|&d| d > 0.0),
+                _ => {}
             }
-            _ => {}
         }
     }
-
-    if has_video { duration } else { None }
+    has_video.then_some(duration).flatten()
 }
 
-/// Probe whether a media file contains a valid audio stream (used to validate
-/// single-pass audio extraction before skipping fallback to original input).
+/// Probe whether a media file contains a valid audio stream.
 pub fn probe_has_audio(path: &Path) -> bool {
-    let mut cmd = Command::new("ffprobe");
-    cmd.args([
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
-        "-show_entries",
-        "stream=codec_type",
-        "-of",
-        "csv=p=0",
-    ])
-    .arg(path);
-
-    run_command_cancellable(&mut cmd, "校验暂存音频流失败")
-        .map(|o| {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .eq_ignore_ascii_case("audio")
-        })
-        .unwrap_or(false)
+    run_ffprobe(
+        path,
+        &[
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ],
+        "校验暂存音频流失败",
+    )
+    .is_ok_and(|s| s.trim().eq_ignore_ascii_case("audio"))
 }
 
 /// Probe the real duration (seconds) of a media file via ffprobe.
 pub fn probe_duration(path: &Path) -> Option<f64> {
-    let mut cmd = Command::new("ffprobe");
-    cmd.args([
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=nokey=1:noprint_wrappers=1",
-    ])
-    .arg(path);
-
-    let output = run_command_cancellable(&mut cmd, "执行ffprobe获取时长失败").ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.trim().parse::<f64>().ok().filter(|d| *d > 0.0)
+    run_ffprobe(
+        path,
+        &[
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+        ],
+        "执行ffprobe获取时长失败",
+    )
+    .ok()?
+    .trim()
+    .parse::<f64>()
+    .ok()
+    .filter(|&d| d > 0.0)
 }
 
 /// Parse XPSNR Y-channel value from FFmpeg stderr (e.g. `XPSNR  y: 42.9312  u: 46.1 ...`).
 pub fn parse_xpsnr_y(stderr: &str) -> Option<f64> {
     for line in stderr.lines().rev() {
-        if let Some(pos) = line.find("XPSNR") {
-            let tail = &line[pos..];
-            if let Some(ypos) = tail.find("y:") {
-                let after = tail[ypos + 2..].trim_start();
-                let token = after.split_whitespace().next()?;
-                if token.eq_ignore_ascii_case("inf") {
-                    return Some(99.0);
-                }
-                if let Ok(val) = token.parse::<f64>()
-                    && val.is_finite()
-                {
-                    return Some(val);
-                }
+        if let Some(pos) = line.find("XPSNR")
+            && let Some(ypos) = line[pos..].find("y:")
+        {
+            let token = line[pos + ypos + 2..].split_whitespace().next()?;
+            if token.eq_ignore_ascii_case("inf") {
+                return Some(99.0);
             }
-        }
-    }
-    None
-}
-
-/// Parse SSIM `All:` value from FFmpeg stderr (e.g. `All:0.984123 (17.99)`).
-pub fn parse_ssim_all(stderr: &str) -> Option<f64> {
-    for line in stderr.lines().rev() {
-        if let Some(pos) = line.find("All:") {
-            let after = &line[pos + 4..];
-            let token = after.split_whitespace().next()?;
             if let Ok(val) = token.parse::<f64>()
                 && val.is_finite()
             {
@@ -1224,48 +989,59 @@ pub fn parse_ssim_all(stderr: &str) -> Option<f64> {
     None
 }
 
-/// Fast 1/3-frame-subsampled XPSNR measurement between reference sample and encoded candidate.
-/// Empirically validated on Jetson Orin: 2× faster than full-frame XPSNR with a consistent
-/// ~+0.35 dB offset, which we subtract here to return the calibrated full-frame equivalent.
-pub fn measure_xpsnr_fast(ref_path: &Path, dist_path: &Path) -> Result<f64> {
-    const SUBSAMPLE_CALIBRATION_OFFSET: f64 = 0.35;
-    let filt = "[0:v]select='not(mod(n,3))',setpts=N/FRAME_RATE/TB,format=yuv420p[r];\
-                [1:v]select='not(mod(n,3))',setpts=N/FRAME_RATE/TB,format=yuv420p[d];\
-                [r][d]xpsnr";
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-hide_banner", "-v", "info", "-i"])
-        .arg(ref_path)
-        .arg("-i")
-        .arg(dist_path)
-        .args(["-filter_complex", filt, "-f", "null", "-"]);
-
-    let output = run_command_cancellable(&mut cmd, "执行XPSNR感知质量评估失败")?;
-    if !output.status.success() {
-        anyhow::bail!("XPSNR评估失败");
+/// Parse SSIM `All:` value from FFmpeg stderr (e.g. `All:0.984123 (17.99)`).
+pub fn parse_ssim_all(stderr: &str) -> Option<f64> {
+    for line in stderr.lines().rev() {
+        if let Some(pos) = line.find("All:") {
+            let token = line[pos + 4..].split_whitespace().next()?;
+            if let Ok(val) = token.parse::<f64>()
+                && val.is_finite()
+            {
+                return Some(val);
+            }
+        }
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = parse_xpsnr_y(&stderr).context("无法解析FFmpeg XPSNR输出")?;
-    Ok((raw - SUBSAMPLE_CALIBRATION_OFFSET).max(0.0))
+    None
 }
 
-/// Fast 1/3-frame-subsampled SSIM measurement fallback when FFmpeg lacks `xpsnr`.
-pub fn measure_ssim_fast(ref_path: &Path, dist_path: &Path) -> Result<f64> {
-    let filt = "[0:v]select='not(mod(n,3))',setpts=N/FRAME_RATE/TB,format=yuv420p[r];\
-                [1:v]select='not(mod(n,3))',setpts=N/FRAME_RATE/TB,format=yuv420p[d];\
-                [r][d]ssim";
+/// Fast 1/3-frame-subsampled perceptual quality measurement (XPSNR or SSIM).
+/// For XPSNR, subtracts the empirically calibrated +0.35 dB subsampling offset.
+pub fn measure_metric_fast(
+    metric: QualityMetric,
+    ref_path: &Path,
+    dist_path: &Path,
+) -> Result<f64> {
+    const XPSNR_SUBSAMPLE_OFFSET: f64 = 0.35;
+    let (filter_name, ctx_msg) = match metric {
+        QualityMetric::Xpsnr => ("xpsnr", "执行XPSNR感知质量评估失败"),
+        QualityMetric::Ssim => ("ssim", "执行SSIM质量评估失败"),
+    };
+    let filt = format!(
+        "[0:v]select='not(mod(n,3))',setpts=N/FRAME_RATE/TB,format=yuv420p[r];\
+         [1:v]select='not(mod(n,3))',setpts=N/FRAME_RATE/TB,format=yuv420p[d];\
+         [r][d]{}",
+        filter_name
+    );
+
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-hide_banner", "-v", "info", "-i"])
         .arg(ref_path)
         .arg("-i")
         .arg(dist_path)
-        .args(["-filter_complex", filt, "-f", "null", "-"]);
+        .args(["-filter_complex", &filt, "-f", "null", "-"]);
 
-    let output = run_command_cancellable(&mut cmd, "执行SSIM质量评估失败")?;
+    let output = run_command_cancellable(&mut cmd, ctx_msg)?;
     if !output.status.success() {
-        anyhow::bail!("SSIM评估失败");
+        anyhow::bail!("{}", ctx_msg);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    parse_ssim_all(&stderr).context("无法解析FFmpeg SSIM输出")
+    match metric {
+        QualityMetric::Xpsnr => {
+            let raw = parse_xpsnr_y(&stderr).context("无法解析FFmpeg XPSNR输出")?;
+            Ok((raw - XPSNR_SUBSAMPLE_OFFSET).max(0.0))
+        }
+        QualityMetric::Ssim => parse_ssim_all(&stderr).context("无法解析FFmpeg SSIM输出"),
+    }
 }
 
 #[cfg(test)]
@@ -1341,16 +1117,12 @@ bit_rate=25500000
             audio_channels: 2,
             ..Default::default()
         };
-        // 96k AAC <= 128k*1.15 -> copy (avoid generational loss & bloat!)
         assert_eq!(AudioPlan::decide(&info, 128), AudioPlan::Copy);
 
-        // 5.1 PCM at 4.6 Mbps -> transcode to at least 256kbps AAC, NOT 128kbps!
         info.audio_codec = Some("pcm_s16le".into());
         info.audio_bitrate = 4_608_000;
         info.audio_channels = 6;
         assert_eq!(AudioPlan::decide(&info, 128), AudioPlan::TranscodeAac(256));
-
-        // Explicit -a 0 -> always copy
         assert_eq!(AudioPlan::decide(&info, 0), AudioPlan::Copy);
     }
 
@@ -1370,7 +1142,8 @@ bit_rate=25500000
         let x_stderr = "[Parsed_xpsnr_2 @ 0x123] XPSNR  y: 42.9312  u: 46.1200  v: 46.5000  (minimum: 42.9312)\n";
         assert!((parse_xpsnr_y(x_stderr).unwrap() - 42.9312).abs() < 1e-4);
 
-        let s_stderr = "[Parsed_ssim_2 @ 0x123] SSIM Y:0.985 (18.2) U:0.991 V:0.992 All:0.987123 (18.90)\n";
+        let s_stderr =
+            "[Parsed_ssim_2 @ 0x123] SSIM Y:0.985 (18.2) U:0.991 V:0.992 All:0.987123 (18.90)\n";
         assert!((parse_ssim_all(s_stderr).unwrap() - 0.987123).abs() < 1e-6);
     }
 
@@ -1386,6 +1159,21 @@ bit_rate=25500000
         assert!(avail.libx265);
         assert!(avail.nvenc);
         assert!(avail.qsv);
-        assert!(!avail.nvmpi);
+        assert!(!avail.vaapi);
+    }
+
+    #[test]
+    fn parse_encoder_arg_handles_aliases_and_rejects_unknown() {
+        assert_eq!(parse_encoder_arg("auto").unwrap(), None);
+        assert_eq!(
+            parse_encoder_arg("jetson").unwrap(),
+            Some(EncoderType::JetsonGst)
+        );
+        assert_eq!(parse_encoder_arg("nvenc").unwrap(), Some(EncoderType::Gpu));
+        assert_eq!(
+            parse_encoder_arg("vt").unwrap(),
+            Some(EncoderType::VideoToolbox)
+        );
+        assert!(parse_encoder_arg("nvmpi").is_err());
     }
 }

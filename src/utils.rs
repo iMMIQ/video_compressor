@@ -1,3 +1,6 @@
+use crate::model::ProcessResult;
+use crate::signal::is_shutdown_requested;
+use crate::state::StateCache;
 use anyhow::{Context, Result};
 use filetime::{FileTime, set_file_times};
 use std::fs::{File, Metadata};
@@ -5,7 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
-/// Format bytes to human readable string
+/// Format bytes to human readable string.
 pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -22,23 +25,83 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Generate output path: same directory as input, with .mp4 extension
+/// Generate video output path: same directory as input, with `.mp4` extension.
 pub fn get_output_path(input_path: &Path) -> PathBuf {
-    let stem = input_path.file_stem().unwrap_or(std::ffi::OsStr::new(""));
-    let parent = input_path.parent().unwrap_or(Path::new(""));
-    parent.join(format!("{}.mp4", stem.to_string_lossy()))
+    input_path.with_extension("mp4")
 }
 
-/// Generate output path for image: same directory as input, with .webp extension
+/// Generate image output path: same directory as input, with `.webp` extension.
 pub fn get_image_output_path(input_path: &Path) -> PathBuf {
-    let stem = input_path.file_stem().unwrap_or(std::ffi::OsStr::new(""));
-    let parent = input_path.parent().unwrap_or(Path::new(""));
-    parent.join(format!("{}.webp", stem.to_string_lossy()))
+    input_path.with_extension("webp")
 }
 
 /// Extract modification time in Unix seconds for state caching.
 pub fn file_mtime_secs(metadata: &Metadata) -> i64 {
     FileTime::from_last_modification_time(metadata).unix_seconds()
+}
+
+/// Validated metadata gathered during media pre-flight checks.
+pub struct PreflightInfo {
+    pub metadata: Metadata,
+    pub input_size: u64,
+    pub mtime_secs: i64,
+}
+
+impl PreflightInfo {
+    pub fn record_skip(
+        &self,
+        input_path: &Path,
+        state_cache: Option<&StateCache>,
+        reason: String,
+        permanent: bool,
+    ) -> Result<ProcessResult> {
+        if let Some(cache) = state_cache {
+            if permanent {
+                cache.record_permanent_skip(input_path, self.input_size, self.mtime_secs, &reason);
+            } else {
+                cache.record_skip(input_path, self.input_size, self.mtime_secs, &reason);
+            }
+        }
+        Ok(ProcessResult::Skipped(reason))
+    }
+}
+
+/// Shared pre-flight check for video & image processing:
+/// 1. Abort early on shutdown signal.
+/// 2. Guard against clobbering a pre-existing distinct output file.
+/// 3. Read file metadata once and check optional persistent skip cache.
+pub fn preflight_media_file(
+    input_path: &Path,
+    output_path: &Path,
+    state_cache: Option<&StateCache>,
+    ignore_cache: bool,
+) -> Result<std::result::Result<PreflightInfo, ProcessResult>> {
+    if is_shutdown_requested() {
+        anyhow::bail!("收到中断信号，跳过处理");
+    }
+    if output_path.exists() && output_path != input_path {
+        return Ok(Err(ProcessResult::Skipped(format!(
+            "目标已存在，跳过避免覆盖: {}",
+            output_path.display()
+        ))));
+    }
+
+    let metadata = std::fs::metadata(input_path).context("无法读取输入文件元数据")?;
+    let input_size = metadata.len();
+    let mtime_secs = file_mtime_secs(&metadata);
+
+    if !ignore_cache
+        && let Some(cache) = state_cache
+        && let Some(reason) = cache.get_cached_skip(input_path, input_size, mtime_secs)
+    {
+        return Ok(Err(ProcessResult::Skipped(format!("{} (缓存)", reason))));
+    }
+
+    Ok(Ok(PreflightInfo {
+        metadata,
+        input_size,
+        mtime_secs,
+    }))
 }
 
 /// Create a temporary file in the same directory as `target_path` so that
@@ -52,11 +115,8 @@ pub fn create_temp_in_same_dir(target_path: &Path, suffix: &str) -> Result<Named
         .with_context(|| format!("无法在 {} 创建临时文件", parent.display()))
 }
 
-/// Detect whether `path` resides on a network/remote filesystem (NFS, SMB/CIFS, FUSE, Ceph, Lustre).
-/// Used to stage `+faststart` MP4 rewrites on fast local `/tmp` and stream-copy once over the network.
-#[cfg(target_os = "linux")]
-pub fn is_network_filesystem(path: &Path) -> bool {
-    use std::ffi::CString;
+#[cfg(unix)]
+fn existing_probe_cpath(path: &Path) -> Option<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
 
     let probe_path = if path.exists() {
@@ -66,7 +126,14 @@ pub fn is_network_filesystem(path: &Path) -> bool {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
     };
-    let Ok(cpath) = CString::new(probe_path.as_os_str().as_bytes()) else {
+    std::ffi::CString::new(probe_path.as_os_str().as_bytes()).ok()
+}
+
+/// Detect whether `path` resides on a network/remote filesystem (NFS, SMB/CIFS, FUSE, Ceph, Lustre).
+/// Used to stage `+faststart` MP4 rewrites on fast local `/tmp` and stream-copy once over the network.
+#[cfg(target_os = "linux")]
+pub fn is_network_filesystem(path: &Path) -> bool {
+    let Some(cpath) = existing_probe_cpath(path) else {
         return false;
     };
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
@@ -74,7 +141,6 @@ pub fn is_network_filesystem(path: &Path) -> bool {
         return false;
     }
 
-    // Standard Linux kernel filesystem magic constants
     const NFS_SUPER_MAGIC: i64 = 0x6969;
     const SMB_SUPER_MAGIC: i64 = 0x517B;
     const CIFS_SUPER_MAGIC: i64 = 0xFF53_4D42;
@@ -83,9 +149,8 @@ pub fn is_network_filesystem(path: &Path) -> bool {
     const CEPH_SUPER_MAGIC: i64 = 0x00C3_6400;
     const LUSTRE_SUPER_MAGIC: i64 = 0x0BD0_0BD0;
 
-    let ftype = stat.f_type as i64;
     matches!(
-        ftype,
+        stat.f_type as i64,
         NFS_SUPER_MAGIC
             | SMB_SUPER_MAGIC
             | CIFS_SUPER_MAGIC
@@ -104,17 +169,7 @@ pub fn is_network_filesystem(_path: &Path) -> bool {
 /// Query free bytes available to unprivileged users on the filesystem containing `path`.
 #[cfg(unix)]
 pub fn available_space_bytes(path: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let probe_path = if path.exists() {
-        path
-    } else {
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-    };
-    let cpath = CString::new(probe_path.as_os_str().as_bytes()).ok()?;
+    let cpath = existing_probe_cpath(path)?;
     let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(cpath.as_ptr(), &mut vfs) } != 0 {
         return None;
@@ -130,9 +185,9 @@ pub fn available_space_bytes(_path: &Path) -> Option<u64> {
 /// Stream-copy a local staged file into a destination `NamedTempFile` using a 1 MiB buffer
 /// (maximizes sequential NFS write throughput while keeping memory bounded).
 pub fn copy_file_to_temp(src_path: &Path, dst_temp: &mut NamedTempFile) -> Result<u64> {
-    const BUF_SIZE: usize = 1024 * 1024; // 1 MiB sequential I/O buffer
-    let mut reader =
-        File::open(src_path).with_context(|| format!("无法打开暂存文件: {}", src_path.display()))?;
+    const BUF_SIZE: usize = 1024 * 1024;
+    let mut reader = File::open(src_path)
+        .with_context(|| format!("无法打开暂存文件: {}", src_path.display()))?;
     let writer = dst_temp.as_file_mut();
     let mut buf = vec![0u8; BUF_SIZE];
     let mut total: u64 = 0;
@@ -170,19 +225,21 @@ pub fn atomic_replace_from_temp(
     let original_mtime = FileTime::from_last_modification_time(original_metadata);
     let original_permissions = original_metadata.permissions();
 
-    temp_file
-        .persist(output_path)
-        .map_err(|e| anyhow::anyhow!("无法原子替换输出文件 {}: {}", output_path.display(), e.error))?;
+    temp_file.persist(output_path).map_err(|e| {
+        anyhow::anyhow!(
+            "无法原子替换输出文件 {}: {}",
+            output_path.display(),
+            e.error
+        )
+    })?;
 
     if output_path != input_path {
         std::fs::remove_file(input_path)
             .with_context(|| format!("新文件已就位，但删除原文件失败: {}", input_path.display()))?;
     }
 
-    set_file_times(output_path, original_atime, original_mtime)
-        .context("无法设置文件时间戳")?;
-    std::fs::set_permissions(output_path, original_permissions)
-        .context("无法设置文件权限")?;
+    set_file_times(output_path, original_atime, original_mtime).context("无法设置文件时间戳")?;
+    std::fs::set_permissions(output_path, original_permissions).context("无法设置文件权限")?;
 
     Ok(())
 }

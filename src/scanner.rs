@@ -1,5 +1,5 @@
 use crate::model::MediaItem;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use walkdir::WalkDir;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -8,22 +8,16 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 ];
 
 // NOTE:
-// - "webp" is intentionally NOT included (avoid re-encoding or flattening animated WebP).
-// - "heic"/"heif" are intentionally NOT included because the `image` crate does not decode them.
+// - "webp" is intentionally excluded (avoid re-encoding or flattening animated WebP).
+// - "heic"/"heif" are excluded because the `image` crate does not decode them.
 // - "gif" is included for static GIFs; animated GIFs are detected and skipped in `image.rs`.
 const IMAGE_EXTENSIONS: &[&str] = &["bmp", "gif", "jpg", "jpeg", "png", "tiff", "tif"];
-
-const WEBP_EXTENSIONS: &[&str] = &["webp"];
 
 #[inline]
 fn matches_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            let lower = ext.to_ascii_lowercase();
-            extensions.contains(&lower.as_str())
-        })
-        .unwrap_or(false)
+        .is_some_and(|ext| extensions.iter().any(|e| ext.eq_ignore_ascii_case(e)))
 }
 
 #[inline]
@@ -55,36 +49,12 @@ where
         .follow_links(true)
         .min_depth(1)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
     {
         if let Some(item) = classify_path(entry.path()) {
             callback(item);
         }
-    }
-}
-
-/// Stream scan WebP files for the one-time container repair mode.
-pub fn scan_webp_streaming<F>(dir: &Path, mut callback: F)
-where
-    F: FnMut(PathBuf),
-{
-    if dir.is_file() {
-        if matches_extension(dir, WEBP_EXTENSIONS) {
-            callback(dir.to_path_buf());
-        }
-        return;
-    }
-
-    for entry in WalkDir::new(dir)
-        .follow_links(true)
-        .min_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| matches_extension(e.path(), WEBP_EXTENSIONS))
-        .filter(|e| e.file_type().is_file())
-    {
-        callback(entry.path().to_path_buf());
     }
 }
 
@@ -109,9 +79,5 @@ mod tests {
         });
         assert_eq!(videos, 1);
         assert_eq!(images, 1);
-
-        let mut webps = 0;
-        scan_webp_streaming(dir.path(), |_| webps += 1);
-        assert_eq!(webps, 1);
     }
 }

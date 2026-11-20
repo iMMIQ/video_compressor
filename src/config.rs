@@ -1,3 +1,8 @@
+/// Default hardware concurrency bounds.
+pub const DEFAULT_GPU_HW_CONCURRENT: usize = 4;
+pub const MAX_AUTO_GPU_CONCURRENT: usize = 8;
+pub const DEFAULT_HW_CONCURRENT: usize = 2;
+
 /// Video encoder backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderType {
@@ -8,8 +13,6 @@ pub enum EncoderType {
     /// Official JetPack GStreamer NVENC (nvv4l2h265enc + nvv4l2decoder + standard ffmpeg remux).
     /// Requires NO custom-compiled FFmpeg.
     JetsonGst,
-    /// Legacy Jetson jetson-ffmpeg wrapper (hevc_nvmpi), kept as opt-in/fallback.
-    JetsonNvmpi,
     /// Intel Quick Sync Video (hevc_qsv).
     Qsv,
     /// Linux VA-API (hevc_vaapi, AMD/Intel).
@@ -23,39 +26,32 @@ pub enum EncoderType {
 impl EncoderType {
     pub fn display_name(self) -> &'static str {
         match self {
-            EncoderType::Cpu => "CPU (libx265)",
-            EncoderType::Gpu => "NVIDIA GPU (hevc_nvenc)",
-            EncoderType::JetsonGst => "Jetson 官方硬件 (GStreamer nvv4l2h265enc)",
-            EncoderType::JetsonNvmpi => "Jetson NVMPI (hevc_nvmpi, 兼容模式)",
-            EncoderType::Qsv => "Intel QSV (hevc_qsv)",
-            EncoderType::Vaapi => "VA-API (hevc_vaapi)",
-            EncoderType::Amf => "AMD AMF (hevc_amf)",
-            EncoderType::VideoToolbox => "Apple VideoToolbox (hevc_videotoolbox)",
+            Self::Cpu => "CPU (libx265)",
+            Self::Gpu => "NVIDIA GPU (hevc_nvenc)",
+            Self::JetsonGst => "Jetson 官方硬件 (GStreamer nvv4l2h265enc)",
+            Self::Qsv => "Intel QSV (hevc_qsv)",
+            Self::Vaapi => "VA-API (hevc_vaapi)",
+            Self::Amf => "AMD AMF (hevc_amf)",
+            Self::VideoToolbox => "Apple VideoToolbox (hevc_videotoolbox)",
         }
     }
 
     pub fn short_id(self) -> &'static str {
         match self {
-            EncoderType::Cpu => "cpu",
-            EncoderType::Gpu => "nvenc",
-            EncoderType::JetsonGst => "jetson-gst",
-            EncoderType::JetsonNvmpi => "jetson-nvmpi",
-            EncoderType::Qsv => "qsv",
-            EncoderType::Vaapi => "vaapi",
-            EncoderType::Amf => "amf",
-            EncoderType::VideoToolbox => "videotoolbox",
+            Self::Cpu => "cpu",
+            Self::Gpu => "nvenc",
+            Self::JetsonGst => "jetson-gst",
+            Self::Qsv => "qsv",
+            Self::Vaapi => "vaapi",
+            Self::Amf => "amf",
+            Self::VideoToolbox => "videotoolbox",
         }
     }
 
     /// Whether this backend runs primarily on dedicated video hardware
     /// (leaving CPU cores free for concurrent image encoding and XPSNR evaluation).
     pub fn is_hardware(self) -> bool {
-        !matches!(self, EncoderType::Cpu)
-    }
-
-    /// Whether this backend can run heterogeneous image processing concurrently with video encoding.
-    pub fn allows_concurrent_images(self) -> bool {
-        !matches!(self, EncoderType::Cpu)
+        !matches!(self, Self::Cpu)
     }
 }
 
@@ -79,8 +75,6 @@ pub struct HardwareCapabilities {
     pub jetson_gst_10bit: bool,
     pub jetson_gst_decoder: bool,
     pub jetson_gst_audio_mux: bool,
-
-    pub jetson_nvmpi_ok: bool,
 
     pub qsv_ok: bool,
     pub vaapi_ok: bool,
@@ -109,7 +103,6 @@ impl Default for HardwareCapabilities {
             jetson_gst_10bit: false,
             jetson_gst_decoder: false,
             jetson_gst_audio_mux: false,
-            jetson_nvmpi_ok: false,
             qsv_ok: false,
             vaapi_ok: false,
             vaapi_device: None,
@@ -129,6 +122,16 @@ pub struct EncoderConfig {
     pub capabilities: HardwareCapabilities,
     /// Target perceptual XPSNR threshold in dB (higher = closer to visually lossless).
     pub target_xpsnr: f64,
+}
+
+/// Bundled immutable options for video compression jobs.
+#[derive(Debug, Clone)]
+pub struct VideoConfig {
+    pub encoder: EncoderConfig,
+    pub max_crf: u8,
+    pub min_compression_ratio: u8,
+    pub audio_bitrate: u32,
+    pub force: bool,
 }
 
 /// Quality search bounds native to an encoder backend.
@@ -154,10 +157,7 @@ pub struct EncodeParams {
     pub fast_preview: bool,
     /// Prefer 10-bit output (Main10 / P010_10LE / yuv420p10le) for better R-D efficiency & HDR safety.
     pub ten_bit: bool,
-    pub pix_fmt: Option<String>,
-    /// Target bitrate in kbps (used only by legacy Jetson NVMPI).
-    pub target_bitrate_kbps: Option<u32>,
-    /// Optional VBV soft peak bitrate cap in kbps (never equal to target_bitrate to avoid pseudo-CBR).
+    /// Optional VBV soft peak bitrate cap in kbps.
     pub maxrate_kbps: Option<u32>,
     /// Optional GPU index for multi-GPU NVENC machines.
     pub gpu_index: Option<usize>,
@@ -170,8 +170,6 @@ impl EncodeParams {
             preset: preset.to_string(),
             fast_preview,
             ten_bit,
-            pix_fmt: None,
-            target_bitrate_kbps: None,
             maxrate_kbps: None,
             gpu_index: None,
         }

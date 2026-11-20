@@ -1,7 +1,6 @@
 mod config;
 mod encoder;
 mod ffmpeg;
-mod gpu;
 mod image;
 mod logging;
 mod model;
@@ -15,17 +14,19 @@ mod webp_mux;
 
 use anyhow::Result;
 use clap::Parser;
-use config::{EncoderConfig, EncoderType};
+use config::{
+    DEFAULT_GPU_HW_CONCURRENT, DEFAULT_HW_CONCURRENT, EncoderConfig, EncoderType,
+    HardwareCapabilities, MAX_AUTO_GPU_CONCURRENT, VideoConfig,
+};
 use crossbeam_channel::{Receiver, bounded, unbounded};
-use ffmpeg::{check_ffmpeg, detect_hardware_capabilities, resolve_encoder_type};
-use gpu::{DEFAULT_JETSON_HW_CONCURRENT, DEFAULT_MAX_CONCURRENT};
+use ffmpeg::{check_ffmpeg, detect_hardware_capabilities, parse_encoder_arg, resolve_encoder_type};
 use logging::{LogLevel, log_always, log_error, log_info, set_log_level};
 use model::{ConversionStats, MediaItem, MediaStats, ProcessResult};
-use scanner::{scan_media_streaming, scan_webp_streaming};
-use scheduler::{VideoJobOptions, run_gpu_parallel, run_hw_decoupled_pool, run_video_pool};
+use scanner::scan_media_streaming;
+use scheduler::{VideoJobOptions, run_video_pool};
 use signal::{install_signal_handlers, is_shutdown_requested};
 use state::StateCache;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -55,7 +56,7 @@ struct Args {
     #[arg(long, default_value = "medium")]
     preset: String,
 
-    /// Video encoder type (auto, gpu, jetson, jetson-gst, nvmpi, qsv, vaapi, amf, videotoolbox, cpu)
+    /// Video encoder type (auto, gpu, jetson, jetson-gst, qsv, vaapi, amf, videotoolbox, cpu)
     #[arg(long, default_value = "auto")]
     encoder: String,
 
@@ -68,17 +69,13 @@ struct Args {
     #[arg(long, default_value = "false")]
     dry_run: bool,
 
-    /// Max concurrent jobs (0 = auto: GPU dynamic up to 8, Jetson/HW 2, CPU 1, images min(cpus, 8))
+    /// Max concurrent jobs (0 = auto: GPU 4/card up to 8, Jetson/HW 2, CPU 1, images min(cpus, 8))
     #[arg(short, long, default_value = "0")]
     jobs: usize,
 
     /// Force serial processing (disable parallel encoding & concurrent image pipeline)
     #[arg(long, default_value = "false")]
     serial: bool,
-
-    /// Repair WebP files produced by the old EXIF-first writer, then exit
-    #[arg(long, default_value = "false")]
-    repair_webp: bool,
 
     /// Log verbosity level (quiet, info, debug)
     #[arg(long, default_value = "info")]
@@ -90,14 +87,16 @@ struct Args {
 
     /// Force re-encoding without pre-skipping already HEVC/AV1/VP9 or low-BPP videos
     /// (still strictly guarantees output is smaller than input)
-    #[arg(short = 'f', long = "force", alias = "reencode-hevc", default_value = "false")]
+    #[arg(
+        short = 'f',
+        long = "force",
+        alias = "reencode-hevc",
+        default_value = "false"
+    )]
     force: bool,
 }
 
-/// Default cap on image-processing concurrency (NFS I/O-bound sweet spot).
 const DEFAULT_MAX_IMAGE_WORKERS: usize = 8;
-
-/// Bounded queue capacity for backpressure between scanner and workers.
 const CHANNEL_CAPACITY: usize = 256;
 
 fn resolve_image_workers(jobs_arg: usize, serial: bool, concurrent_with_video: bool) -> usize {
@@ -107,7 +106,7 @@ fn resolve_image_workers(jobs_arg: usize, serial: bool, concurrent_with_video: b
     if jobs_arg > 0 {
         return jobs_arg;
     }
-    let cpus = std::thread::available_parallelism()
+    let cpus = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     if concurrent_with_video {
@@ -117,29 +116,24 @@ fn resolve_image_workers(jobs_arg: usize, serial: bool, concurrent_with_video: b
     }
 }
 
-fn resolve_gpu_max_jobs(jobs_arg: usize) -> usize {
-    if jobs_arg > 0 {
-        jobs_arg
-    } else {
-        DEFAULT_MAX_CONCURRENT
-    }
-}
-
-fn resolve_hw_jobs(jobs_arg: usize, serial: bool) -> usize {
+fn resolve_video_jobs(
+    encoder_type: EncoderType,
+    caps: &HardwareCapabilities,
+    jobs_arg: usize,
+    serial: bool,
+) -> usize {
     if serial {
-        1
-    } else if jobs_arg > 0 {
-        jobs_arg
-    } else {
-        DEFAULT_JETSON_HW_CONCURRENT
+        return 1;
     }
-}
-
-fn resolve_cpu_video_jobs(jobs_arg: usize, serial: bool) -> usize {
-    if serial || jobs_arg == 0 {
-        1
-    } else {
-        jobs_arg
+    if jobs_arg > 0 {
+        return jobs_arg;
+    }
+    match encoder_type {
+        EncoderType::Gpu => {
+            (caps.nvenc_gpu_count.max(1) * DEFAULT_GPU_HW_CONCURRENT).min(MAX_AUTO_GPU_CONCURRENT)
+        }
+        EncoderType::Cpu => 1,
+        _ => DEFAULT_HW_CONCURRENT,
     }
 }
 
@@ -156,62 +150,6 @@ fn build_cache_fingerprint(encoder_type: EncoderType, args: &Args) -> String {
     )
 }
 
-fn repair_webp_files(input: &Path, dry_run: bool) -> Result<()> {
-    log_always("WebP 容器恢复模式");
-    log_always(&format!("输入路径: {}", input.display()));
-    log_always(&format!(
-        "执行方式: {}",
-        if dry_run { "仅检测" } else { "原位修复" }
-    ));
-
-    let mut scanned = 0usize;
-    let mut affected = 0usize;
-    let mut failed = 0usize;
-    scan_webp_streaming(input, |path| {
-        if is_shutdown_requested() {
-            return;
-        }
-        scanned += 1;
-        match webp_mux::repair_file(&path, dry_run) {
-            Ok(webp_mux::RepairResult::NotAffected) => {}
-            Ok(webp_mux::RepairResult::WouldRepair { old_size, new_size }) => {
-                affected += 1;
-                log_info(&format!(
-                    "[待修复] {} ({} -> {})",
-                    path.display(),
-                    format_size(old_size),
-                    format_size(new_size)
-                ));
-            }
-            Ok(webp_mux::RepairResult::Repaired { old_size, new_size }) => {
-                affected += 1;
-                log_info(&format!(
-                    "[已修复] {} ({} -> {})",
-                    path.display(),
-                    format_size(old_size),
-                    format_size(new_size)
-                ));
-            }
-            Err(error) => {
-                failed += 1;
-                log_error(&format!("[失败] {}: {:#}", path.display(), error));
-            }
-        }
-    });
-
-    log_always(&format!(
-        "扫描完成: {} 个 WebP，{} {}，{} 个失败",
-        scanned,
-        affected,
-        if dry_run { "个待修复" } else { "个已修复" },
-        failed
-    ));
-    if failed > 0 {
-        anyhow::bail!("有 {} 个 WebP 修复失败", failed);
-    }
-    Ok(())
-}
-
 /// Process images from a streaming channel using a fixed worker pool.
 fn run_image_pool(
     work_rx: Receiver<PathBuf>,
@@ -222,7 +160,7 @@ fn run_image_pool(
     let workers_count = num_workers.max(1);
     log_info(&format!("图片处理线程池启动 ({} 线程)", workers_count));
 
-    let (result_tx, result_rx) = unbounded::<(PathBuf, anyhow::Result<ProcessResult>)>();
+    let (result_tx, result_rx) = unbounded::<(PathBuf, Result<ProcessResult>)>();
 
     let workers: Vec<_> = (0..workers_count)
         .map(|_| {
@@ -234,8 +172,7 @@ fn run_image_pool(
                     if is_shutdown_requested() {
                         break;
                     }
-                    let result = image::process_image(&path, cache.as_deref());
-                    let _ = tx.send((path, result));
+                    let _ = tx.send((path.clone(), image::process_image(&path, cache.as_deref())));
                 }
             })
         })
@@ -250,18 +187,13 @@ fn run_image_pool(
         match process_result {
             Ok(ProcessResult::Converted(file_stats)) => {
                 stats.record_converted(file_stats);
-                let ratio = if file_stats.input_size > 0 {
-                    (1.0 - file_stats.output_size as f64 / file_stats.input_size as f64) * 100.0
-                } else {
-                    0.0
-                };
                 log_info(&format!(
                     "[图片 {}] ✓ {} ({} -> {}, {:.1}% 压缩)",
                     count,
                     image_path.display(),
                     format_size(file_stats.input_size),
                     format_size(file_stats.output_size),
-                    ratio
+                    file_stats.savings_percent()
                 ));
             }
             Ok(ProcessResult::Skipped(reason)) => {
@@ -318,24 +250,21 @@ fn main() -> Result<()> {
         anyhow::bail!("输入目录不存在: {}", args.input.display());
     }
 
-    if args.repair_webp {
-        return repair_webp_files(&args.input, args.dry_run);
-    }
+    let requested_encoder = parse_encoder_arg(&args.encoder)?;
+    let capabilities = detect_hardware_capabilities(requested_encoder)?;
+    let encoder_type = resolve_encoder_type(requested_encoder, &capabilities);
+    check_ffmpeg(encoder_type, &capabilities)?;
 
-    // Real runtime hardware capability probe (once at startup).
-    let capabilities = detect_hardware_capabilities()?;
-    let encoder_type = resolve_encoder_type(&args.encoder, &capabilities)?;
-    let encoder_config = EncoderConfig {
-        encoder_type,
-        preset: args.preset.clone(),
-        capabilities,
-        target_xpsnr: args.target_xpsnr,
-    };
+    let video_jobs = resolve_video_jobs(encoder_type, &capabilities, args.jobs, args.serial);
+    let concurrent_images = encoder_type.is_hardware() && !args.serial;
+    let image_workers = resolve_image_workers(args.jobs, args.serial, concurrent_images);
 
-    let cache_fingerprint = build_cache_fingerprint(encoder_type, &args);
     let state_cache = match &args.state_file {
         Some(path) => {
-            let cache = StateCache::open_with_fingerprint(path, cache_fingerprint)?;
+            let cache = StateCache::open_with_fingerprint(
+                path,
+                build_cache_fingerprint(encoder_type, &args),
+            )?;
             log_info(&format!(
                 "已加载状态缓存: {} ({} 条记录)",
                 path.display(),
@@ -355,7 +284,11 @@ fn main() -> Result<()> {
         args.target_xpsnr,
         args.max_crf,
         args.min_compression_ratio,
-        if args.force { " | 强制不跳过(已HEVC/低BPP也重编码评估)" } else { "" }
+        if args.force {
+            " | 强制不跳过(已HEVC/低BPP也重编码评估)"
+        } else {
+            ""
+        }
     ));
     log_info(&format!(
         "编码预设: {} | 音频目标: {} (兼容低码率自动直拷)",
@@ -367,33 +300,26 @@ fn main() -> Result<()> {
         }
     ));
 
-    check_ffmpeg(encoder_config.encoder_type, &encoder_config.capabilities)?;
-
-    let mut results = ConversionStats::default();
-
     if args.dry_run {
         log_info("单次遍历扫描媒体文件中...\n");
-        let mut video_count = 0usize;
-        let mut image_count = 0usize;
+        let (mut video_count, mut image_count) = (0usize, 0usize);
         scan_media_streaming(&args.input, |item| match item {
             MediaItem::Video(path) => {
                 video_count += 1;
-                let output_path = get_output_path(&path);
                 log_info(&format!(
                     "[视频 {}] {} -> (dry run) {}",
                     video_count,
                     path.display(),
-                    output_path.display()
+                    get_output_path(&path).display()
                 ));
             }
             MediaItem::Image(path) => {
                 image_count += 1;
-                let output_path = get_image_output_path(&path);
                 log_info(&format!(
                     "[图片 {}] {} -> (dry run) {}",
                     image_count,
                     path.display(),
-                    output_path.display()
+                    get_image_output_path(&path).display()
                 ));
             }
         });
@@ -404,149 +330,90 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let concurrent_images = encoder_type.allows_concurrent_images() && !args.serial;
-    let image_workers = resolve_image_workers(args.jobs, args.serial, concurrent_images);
-
-    if concurrent_images {
-        log_info("开始单次流式扫描，视频(专用硬件)与图片(CPU)异构并行处理...\n");
-        let (video_tx, video_rx) = bounded::<PathBuf>(CHANNEL_CAPACITY);
-        let (image_tx, image_rx) = bounded::<PathBuf>(CHANNEL_CAPACITY);
-        let video_discovered = Arc::new(AtomicUsize::new(0));
-        let video_discovered_scan = video_discovered.clone();
-
-        let input_clone = args.input.clone();
-        let scan_handle = thread::spawn(move || {
-            scan_media_streaming(&input_clone, |item| {
-                if is_shutdown_requested() {
-                    return;
-                }
-                match item {
-                    MediaItem::Video(path) => {
-                        video_discovered_scan.fetch_add(1, Ordering::Relaxed);
-                        let _ = video_tx.send(path);
-                    }
-                    MediaItem::Image(path) => {
-                        let _ = image_tx.send(path);
-                    }
-                }
-            });
-        });
-
-        let img_cache = state_cache.clone();
-        let image_handle =
-            thread::spawn(move || run_image_pool(image_rx, image_workers, img_cache));
-
-        if encoder_type == EncoderType::Gpu {
-            let video_options = VideoJobOptions {
-                encoder_config,
-                max_crf: args.max_crf,
-                min_compression_ratio: args.min_compression_ratio,
-                audio_bitrate: args.audio_bitrate,
-                force: args.force,
-                max_concurrency: resolve_gpu_max_jobs(args.jobs),
-                state_cache,
-            };
-            run_gpu_parallel(
-                video_rx,
-                video_discovered,
-                &video_options,
-                &mut results.video,
-            )?;
-        } else {
-            let video_options = VideoJobOptions {
-                encoder_config,
-                max_crf: args.max_crf,
-                min_compression_ratio: args.min_compression_ratio,
-                audio_bitrate: args.audio_bitrate,
-                force: args.force,
-                max_concurrency: if encoder_type == EncoderType::JetsonNvmpi {
-                    1
-                } else {
-                    resolve_hw_jobs(args.jobs, args.serial)
-                },
-                state_cache,
-            };
-            run_hw_decoupled_pool(
-                video_rx,
-                video_discovered,
-                &video_options,
-                args.serial,
-                &mut results.video,
-            )?;
-        }
-
-        let _ = scan_handle.join();
-        if let Ok(image_stats) = image_handle.join() {
-            results.image = image_stats;
-        }
-    } else {
-        let video_jobs = if encoder_type.is_hardware() {
-            1
-        } else {
-            resolve_cpu_video_jobs(args.jobs, args.serial)
-        };
-        log_info(&format!(
-            "开始单次流式扫描和处理 (视频并发: {}, 图片并发: {})...\n",
-            video_jobs, image_workers
-        ));
-
-        let (video_tx, video_rx) = bounded::<PathBuf>(CHANNEL_CAPACITY);
-        let video_discovered = Arc::new(AtomicUsize::new(0));
-        let video_discovered_scan = video_discovered.clone();
-
-        let input_clone = args.input.clone();
-        let scan_handle = thread::spawn(move || {
-            let mut deferred_images = Vec::new();
-            scan_media_streaming(&input_clone, |item| {
-                if is_shutdown_requested() {
-                    return;
-                }
-                match item {
-                    MediaItem::Video(path) => {
-                        video_discovered_scan.fetch_add(1, Ordering::Relaxed);
-                        let _ = video_tx.send(path);
-                    }
-                    MediaItem::Image(path) => {
-                        deferred_images.push(path);
-                    }
-                }
-            });
-            deferred_images
-        });
-
-        let video_options = VideoJobOptions {
-            encoder_config,
+    let video_options = VideoJobOptions {
+        video: VideoConfig {
+            encoder: EncoderConfig {
+                encoder_type,
+                preset: args.preset,
+                capabilities,
+                target_xpsnr: args.target_xpsnr,
+            },
             max_crf: args.max_crf,
             min_compression_ratio: args.min_compression_ratio,
             audio_bitrate: args.audio_bitrate,
             force: args.force,
-            max_concurrency: video_jobs,
-            state_cache: state_cache.clone(),
-        };
-        run_video_pool(
-            video_rx,
-            video_discovered,
-            &video_options,
-            &mut results.video,
-        )?;
+        },
+        max_concurrency: video_jobs,
+        serial: args.serial,
+        state_cache: state_cache.clone(),
+    };
 
-        let deferred_images = scan_handle.join().unwrap_or_default();
-        if !deferred_images.is_empty() && !is_shutdown_requested() {
-            log_info(&format!(
-                "\n=== 图片转换 ({} 个文件) ===",
-                deferred_images.len()
-            ));
-            let (img_tx, img_rx) = bounded::<PathBuf>(CHANNEL_CAPACITY);
-            let feeder = thread::spawn(move || {
-                for path in deferred_images {
-                    if is_shutdown_requested() || img_tx.send(path).is_err() {
-                        break;
+    let mut results = ConversionStats::default();
+    let (video_tx, video_rx) = bounded::<PathBuf>(CHANNEL_CAPACITY);
+    let video_discovered = Arc::new(AtomicUsize::new(0));
+
+    let (image_tx, image_handle) = if concurrent_images {
+        log_info("开始单次流式扫描，视频(专用硬件)与图片(CPU)异构并行处理...\n");
+        let (tx, rx) = bounded::<PathBuf>(CHANNEL_CAPACITY);
+        let img_cache = state_cache.clone();
+        let handle = thread::spawn(move || run_image_pool(rx, image_workers, img_cache));
+        (Some(tx), Some(handle))
+    } else {
+        log_info(&format!(
+            "开始单次流式扫描和处理 (视频并发: {}, 图片并发: {})...\n",
+            video_jobs, image_workers
+        ));
+        (None, None)
+    };
+
+    let scan_input = args.input.clone();
+    let scan_discovered = video_discovered.clone();
+    let scan_handle = thread::spawn(move || {
+        let mut deferred_images = Vec::new();
+        scan_media_streaming(&scan_input, |item| {
+            if is_shutdown_requested() {
+                return;
+            }
+            match item {
+                MediaItem::Video(path) => {
+                    scan_discovered.fetch_add(1, Ordering::Relaxed);
+                    let _ = video_tx.send(path);
+                }
+                MediaItem::Image(path) => {
+                    if let Some(ref tx) = image_tx {
+                        let _ = tx.send(path);
+                    } else {
+                        deferred_images.push(path);
                     }
                 }
-            });
-            results.image = run_image_pool(img_rx, image_workers, state_cache);
-            let _ = feeder.join();
+            }
+        });
+        deferred_images
+    });
+
+    run_video_pool(
+        video_rx,
+        video_discovered,
+        &video_options,
+        &mut results.video,
+    )?;
+
+    let deferred_images = scan_handle.join().unwrap_or_default();
+    if let Some(handle) = image_handle {
+        if let Ok(image_stats) = handle.join() {
+            results.image = image_stats;
         }
+    } else if !deferred_images.is_empty() && !is_shutdown_requested() {
+        log_info(&format!(
+            "\n=== 图片转换 ({} 个文件) ===",
+            deferred_images.len()
+        ));
+        let (img_tx, img_rx) = unbounded::<PathBuf>();
+        for path in deferred_images {
+            let _ = img_tx.send(path);
+        }
+        drop(img_tx);
+        results.image = run_image_pool(img_rx, image_workers, state_cache);
     }
 
     if is_shutdown_requested() {

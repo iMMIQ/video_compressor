@@ -14,13 +14,17 @@ pub enum ProcessResult {
     Skipped(String),
 }
 
-/// Size and encoding stats for one converted file.
+/// Size stats for one converted file.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FileStats {
     pub input_size: u64,
     pub output_size: u64,
-    #[allow(dead_code)]
-    pub used_crf: u8,
+}
+
+impl FileStats {
+    pub fn savings_percent(&self) -> f64 {
+        savings_percent(self.input_size, self.output_size)
+    }
 }
 
 /// Aggregate statistics for a single media category (video or image).
@@ -53,11 +57,7 @@ impl MediaStats {
     }
 
     pub fn savings_percent(&self) -> f64 {
-        if self.total_input_size == 0 {
-            0.0
-        } else {
-            (1.0 - self.total_output_size as f64 / self.total_input_size as f64) * 100.0
-        }
+        savings_percent(self.total_input_size, self.total_output_size)
     }
 }
 
@@ -77,5 +77,14 @@ impl ConversionStats {
             total_input_size: self.video.total_input_size + self.image.total_input_size,
             total_output_size: self.video.total_output_size + self.image.total_output_size,
         }
+    }
+}
+
+#[inline]
+pub fn savings_percent(input_size: u64, output_size: u64) -> f64 {
+    if input_size == 0 {
+        0.0
+    } else {
+        (1.0 - output_size as f64 / input_size as f64) * 100.0
     }
 }

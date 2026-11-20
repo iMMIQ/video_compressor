@@ -1,4 +1,4 @@
-use crate::config::{EncodeParams, EncoderConfig, EncoderType, HardwareCapabilities, QualityProfile};
+use crate::config::{EncodeParams, EncoderType, HardwareCapabilities, QualityProfile};
 use crate::ffmpeg::{AudioPlan, VideoInfo, probe_duration, probe_has_audio};
 use crate::logging::{log_debug, log_info};
 use crate::signal::{
@@ -11,10 +11,16 @@ use std::process::Command;
 use std::sync::{Condvar, Mutex};
 use tempfile::NamedTempFile;
 
-/// Bounded hardware-encoder permit pool so I/O, ffprobe, XPSNR evaluation, and remux
-/// can run concurrently without idling dedicated video encoding hardware.
+struct SlotState {
+    in_use: usize,
+    limit: usize,
+}
+
+/// Bounded hardware-encoder permit pool with dynamic session-limit shrinking.
+/// Allows I/O, ffprobe, XPSNR evaluation, and remux to overlap with hardware encoding
+/// without idling dedicated video silicon.
 pub struct HwSlotPool {
-    available: Mutex<usize>,
+    state: Mutex<SlotState>,
     cvar: Condvar,
 }
 
@@ -25,26 +31,45 @@ pub struct HwPermit<'a> {
 impl HwSlotPool {
     pub fn new(slots: usize) -> Self {
         Self {
-            available: Mutex::new(slots.max(1)),
+            state: Mutex::new(SlotState {
+                in_use: 0,
+                limit: slots.max(1),
+            }),
             cvar: Condvar::new(),
         }
     }
 
+    pub fn limit(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).limit
+    }
+
     pub fn acquire(&self) -> HwPermit<'_> {
-        let mut avail = self.available.lock().unwrap_or_else(|e| e.into_inner());
-        while *avail == 0 {
-            avail = self.cvar.wait(avail).unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while st.in_use >= st.limit {
+            st = self.cvar.wait(st).unwrap_or_else(|e| e.into_inner());
         }
-        *avail -= 1;
+        st.in_use += 1;
         HwPermit { pool: self }
+    }
+
+    /// Shrink concurrency limit safely when an NVENC session-limit error occurs.
+    /// Using `observed_limit` prevents multiple workers failing in the same wave
+    /// from over-shrinking the cap below the true concurrent capacity.
+    pub fn shrink_below(&self, observed_limit: usize) -> usize {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let target = st.in_use.min(observed_limit.saturating_sub(1)).max(1);
+        if target < st.limit {
+            st.limit = target;
+        }
+        st.limit
     }
 }
 
 impl Drop for HwPermit<'_> {
     fn drop(&mut self) {
-        let mut avail = self.pool.available.lock().unwrap_or_else(|e| e.into_inner());
-        *avail += 1;
-        self.pool.cvar.notify_one();
+        let mut st = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.in_use = st.in_use.saturating_sub(1);
+        self.pool.cvar.notify_all();
     }
 }
 
@@ -55,276 +80,150 @@ pub enum EncodeOutcome {
     AbortedSizeLimit { written_bytes: u64 },
 }
 
-/// Strategy trait encapsulating backend-specific video encoding across
-/// Jetson official GStreamer nvv4l2, Desktop NVENC, QSV, VAAPI, AMF, VideoToolbox,
-/// legacy NVMPI, and CPU libx265.
-pub trait VideoEncoder: Send + Sync {
-    fn encoder_type(&self) -> EncoderType;
-
-    /// Whether this encoder can safely handle the given video's resolution/properties.
-    fn supports_video(&self, _info: &VideoInfo) -> bool {
-        true
-    }
-
-    /// Whether this encoder produces 10-bit HEVC (Main10) output.
-    fn supports_10bit(&self) -> bool {
-        false
-    }
-
-    /// Whether this encoder supports direct QP/CQ/CRF perceptual search.
-    /// Legacy Jetson NVMPI only supports bitrate control and returns `false`.
-    fn supports_quality_search(&self) -> bool {
-        true
-    }
-
-    /// Native quality search bounds clamped by user's `max_crf`.
-    fn quality_profile(&self, max_crf: u8) -> QualityProfile;
-
-    /// Encode a pure-video (`-an`) reference sample for perceptual quality & bitrate estimation.
-    /// Returns output file size in bytes.
-    fn encode_sample(
-        &self,
-        sample_path: &Path,
-        sample_info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<u64>;
-
-    /// Full encode with optional real-time output size watchdog and hardware-slot gating.
-    #[allow(clippy::too_many_arguments)]
-    fn full_encode(
-        &self,
-        input_path: &Path,
-        info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        audio_plan: AudioPlan,
-        max_bytes: Option<u64>,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<EncodeOutcome>;
+/// Lightweight enum-dispatched encoder backend (zero heap allocation, zero capability cloning).
+#[derive(Debug, Clone, Copy)]
+pub struct Encoder<'a> {
+    kind: EncoderType,
+    caps: &'a HardwareCapabilities,
 }
 
-pub struct CpuEncoder {
-    caps: HardwareCapabilities,
-}
+impl<'a> Encoder<'a> {
+    pub const JETSON_MIN_DIMENSION: u32 = 160;
 
-pub struct GpuEncoder {
-    caps: HardwareCapabilities,
-}
-
-pub struct JetsonGstEncoder {
-    caps: HardwareCapabilities,
-}
-
-pub struct JetsonNvmpiEncoder;
-
-pub struct QsvEncoder;
-
-pub struct VaapiEncoder {
-    device: String,
-}
-
-pub struct AmfEncoder;
-
-pub struct VideoToolboxEncoder;
-
-pub fn create_encoder(config: &EncoderConfig) -> Box<dyn VideoEncoder> {
-    create_encoder_of(config.encoder_type, &config.capabilities)
-}
-
-pub fn create_encoder_of(
-    encoder_type: EncoderType,
-    caps: &HardwareCapabilities,
-) -> Box<dyn VideoEncoder> {
-    match encoder_type {
-        EncoderType::Cpu => Box::new(CpuEncoder { caps: caps.clone() }),
-        EncoderType::Gpu => Box::new(GpuEncoder { caps: caps.clone() }),
-        EncoderType::JetsonGst => Box::new(JetsonGstEncoder { caps: caps.clone() }),
-        EncoderType::JetsonNvmpi => Box::new(JetsonNvmpiEncoder),
-        EncoderType::Qsv => Box::new(QsvEncoder),
-        EncoderType::Vaapi => Box::new(VaapiEncoder {
-            device: caps
-                .vaapi_device
-                .clone()
-                .unwrap_or_else(|| "/dev/dri/renderD128".to_string()),
-        }),
-        EncoderType::Amf => Box::new(AmfEncoder),
-        EncoderType::VideoToolbox => Box::new(VideoToolboxEncoder),
+    pub fn new(kind: EncoderType, caps: &'a HardwareCapabilities) -> Self {
+        Self { kind, caps }
     }
-}
 
-/// Map x265-style presets (or direct `p1`..`p7`) to NVENC presets.
-pub fn map_nvenc_preset(preset: &str) -> &'static str {
-    match preset.to_lowercase().as_str() {
-        "p1" | "ultrafast" | "superfast" => "p1",
-        "p2" | "veryfast" => "p2",
-        "p3" | "faster" => "p3",
-        "p4" | "fast" => "p4",
-        "p5" | "medium" => "p5",
-        "p6" | "slow" => "p6",
-        "p7" | "slower" | "veryslow" => "p7",
-        _ => "p6",
+    pub fn kind(&self) -> EncoderType {
+        self.kind
     }
-}
 
-/// Tail of stderr for concise error reporting.
-fn stderr_tail(output: &std::process::Output) -> String {
-    let text = String::from_utf8_lossy(&output.stderr);
-    let mut lines: Vec<&str> = text.lines().rev().take(15).collect();
-    lines.reverse();
-    lines.join("\n")
-}
-
-/// Append HDR / color metadata tags to FFmpeg output when known.
-fn append_color_tags(cmd: &mut Command, info: &VideoInfo) {
-    if let Some(cp) = &info.color_primaries {
-        cmd.arg("-color_primaries").arg(cp);
-    }
-    if let Some(ct) = &info.color_transfer {
-        cmd.arg("-color_trc").arg(ct);
-    }
-    if let Some(cs) = &info.color_space {
-        cmd.arg("-colorspace").arg(cs);
-    }
-}
-
-/// Execute a standard FFmpeg encode command with optional size watchdog and HW slot permit.
-#[allow(clippy::too_many_arguments)]
-fn run_ffmpeg_watched(
-    pre_input_args: &[String],
-    input_path: &Path,
-    video_args: &[String],
-    info: &VideoInfo,
-    audio_plan: AudioPlan,
-    output_path: &Path,
-    max_bytes: Option<u64>,
-    hw_slots: Option<&HwSlotPool>,
-    context_msg: &str,
-) -> Result<EncodeOutcome> {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-y", "-hide_banner", "-v", "error"]);
-    for arg in pre_input_args {
-        cmd.arg(arg);
-    }
-    cmd.arg("-i").arg(input_path);
-    cmd.args(["-map", "0:v:0"]);
-    if !matches!(audio_plan, AudioPlan::None) {
-        cmd.args(["-map", "0:a:0?"]);
-    }
-    for arg in video_args {
-        cmd.arg(arg);
-    }
-    append_color_tags(&mut cmd, info);
-    audio_plan.append_ffmpeg_args(&mut cmd);
-    cmd.args(["-map_metadata", "0", "-tag:v", "hvc1", "-movflags", "+faststart"]);
-    cmd.arg(output_path);
-
-    let watchdog = max_bytes.map(|limit| SizeWatchdog {
-        watch_path: output_path,
-        max_bytes: limit,
-    });
-
-    let outcome = {
-        let _permit = hw_slots.map(|pool| pool.acquire());
-        run_command_watched(&mut cmd, watchdog, context_msg)?
-    };
-
-    match outcome {
-        WatchedOutcome::SizeLimitExceeded { written_bytes } => {
-            Ok(EncodeOutcome::AbortedSizeLimit { written_bytes })
-        }
-        WatchedOutcome::Finished(out) => {
-            if !out.status.success() {
-                anyhow::bail!("{}: {}", context_msg, stderr_tail(&out));
+    pub fn supports_video(&self, info: &VideoInfo) -> bool {
+        match self.kind {
+            EncoderType::JetsonGst => {
+                info.width >= Self::JETSON_MIN_DIMENSION
+                    && info.height >= Self::JETSON_MIN_DIMENSION
             }
-            let size = std::fs::metadata(output_path)
-                .context("无法读取编码输出文件")?
-                .len();
-            Ok(EncodeOutcome::Completed(size))
+            _ => true,
         }
     }
-}
 
-// ============================================================================
-// 1. CPU Encoder (libx265, 10-bit + psychovisual tuning)
-// ============================================================================
+    pub fn supports_10bit(&self) -> bool {
+        match self.kind {
+            EncoderType::Cpu => self.caps.x265_10bit,
+            EncoderType::Gpu => self.caps.nvenc_10bit,
+            EncoderType::JetsonGst => self.caps.jetson_gst_10bit,
+            EncoderType::Qsv | EncoderType::VideoToolbox => true,
+            EncoderType::Vaapi | EncoderType::Amf => false,
+        }
+    }
 
-impl CpuEncoder {
-    fn build_video_args(&self, params: &EncodeParams) -> Vec<String> {
-        let preset = if params.fast_preview {
-            "fast".to_string()
+    pub fn sample_extension(&self) -> &'static str {
+        if self.kind == EncoderType::JetsonGst {
+            ".mkv"
         } else {
-            params.preset.clone()
-        };
-        let mut args = vec![
-            "-c:v".to_string(),
-            "libx265".to_string(),
-            "-crf".to_string(),
-            params.quality.to_string(),
-            "-preset".to_string(),
-            preset,
-        ];
-        if params.ten_bit && self.caps.x265_10bit {
-            args.push("-pix_fmt".to_string());
-            args.push("yuv420p10le".to_string());
-        } else if let Some(fmt) = &params.pix_fmt {
-            args.push("-pix_fmt".to_string());
-            args.push(fmt.clone());
-        }
-        // Psychovisual tuning: dark-scene AQ + limited SAO (prevents plastic smoothing) + mild deblock.
-        // Note: removed invalid `fast=1` that x265 previously warned as unknown option.
-        args.push("-x265-params".to_string());
-        args.push("aq-mode=3:limit-sao=1:deblock=-1,-1:log-level=error".to_string());
-        args
-    }
-}
-
-impl VideoEncoder for CpuEncoder {
-    fn encoder_type(&self) -> EncoderType {
-        EncoderType::Cpu
-    }
-
-    fn supports_10bit(&self) -> bool {
-        self.caps.x265_10bit
-    }
-
-    fn quality_profile(&self, max_crf: u8) -> QualityProfile {
-        let max_q = max_crf.clamp(22, 32);
-        QualityProfile {
-            min_q: 18,
-            anchor_q: 24.min(max_q),
-            max_q,
-            low_probe_delta: 4,
+            ".mp4"
         }
     }
 
-    fn encode_sample(
+    pub fn quality_profile(&self, max_crf: u8) -> QualityProfile {
+        match self.kind {
+            EncoderType::Cpu => {
+                let max_q = max_crf.clamp(22, 32);
+                QualityProfile {
+                    min_q: 18,
+                    anchor_q: 24.min(max_q),
+                    max_q,
+                    low_probe_delta: 4,
+                }
+            }
+            EncoderType::Gpu => {
+                let max_q = max_crf.clamp(24, 36);
+                QualityProfile {
+                    min_q: 18,
+                    anchor_q: 26.min(max_q),
+                    max_q,
+                    low_probe_delta: 4,
+                }
+            }
+            EncoderType::JetsonGst => {
+                let max_q = max_crf.clamp(26, 36);
+                QualityProfile {
+                    min_q: 22,
+                    anchor_q: 28.min(max_q),
+                    max_q,
+                    low_probe_delta: 4,
+                }
+            }
+            EncoderType::Qsv => {
+                let max_q = max_crf.clamp(24, 34);
+                QualityProfile {
+                    min_q: 18,
+                    anchor_q: 25.min(max_q),
+                    max_q,
+                    low_probe_delta: 4,
+                }
+            }
+            EncoderType::Vaapi | EncoderType::Amf => {
+                let max_q = max_crf.clamp(24, 34);
+                QualityProfile {
+                    min_q: 18,
+                    anchor_q: 26.min(max_q),
+                    max_q,
+                    low_probe_delta: 4,
+                }
+            }
+            EncoderType::VideoToolbox => QualityProfile {
+                // VideoToolbox `-q:v` is inverted (1..100, higher=better); mapped as `100 - q * 2`.
+                min_q: 12,
+                anchor_q: 20,
+                max_q: 30,
+                low_probe_delta: 4,
+            },
+        }
+    }
+
+    /// Encode a pure-video (`-an`) reference sample for perceptual search.
+    pub fn encode_sample(
         &self,
         sample_path: &Path,
         sample_info: &VideoInfo,
         output_path: &Path,
         params: &EncodeParams,
-        _hw_slots: Option<&HwSlotPool>,
+        hw_slots: Option<&HwSlotPool>,
     ) -> Result<u64> {
-        let video_args = self.build_video_args(params);
-        match run_ffmpeg_watched(
-            &[],
-            sample_path,
-            &video_args,
-            sample_info,
-            AudioPlan::None,
-            output_path,
-            None,
-            None,
-            "CPU样本预览编码失败",
-        )? {
+        let outcome = if self.kind == EncoderType::JetsonGst {
+            // Skip MP4 remux for sample probing; measure Matroska output directly.
+            self.jetson_encode_video_track(
+                sample_path,
+                sample_info,
+                output_path,
+                AudioPlan::None,
+                None,
+                params,
+                None,
+                hw_slots,
+            )?
+        } else {
+            self.full_encode(
+                sample_path,
+                sample_info,
+                output_path,
+                params,
+                AudioPlan::None,
+                None,
+                hw_slots,
+            )?
+        };
+        match outcome {
             EncodeOutcome::Completed(sz) => Ok(sz),
             EncodeOutcome::AbortedSizeLimit { .. } => unreachable!(),
         }
     }
 
-    fn full_encode(
+    /// Full encode with optional real-time output size watchdog and hardware-slot gating.
+    #[allow(clippy::too_many_arguments)]
+    pub fn full_encode(
         &self,
         input_path: &Path,
         info: &VideoInfo,
@@ -332,46 +231,173 @@ impl VideoEncoder for CpuEncoder {
         params: &EncodeParams,
         audio_plan: AudioPlan,
         max_bytes: Option<u64>,
-        _hw_slots: Option<&HwSlotPool>,
+        hw_slots: Option<&HwSlotPool>,
     ) -> Result<EncodeOutcome> {
-        let video_args = self.build_video_args(params);
-        run_ffmpeg_watched(
-            &[],
-            input_path,
-            &video_args,
-            info,
-            audio_plan,
-            output_path,
-            max_bytes,
-            None,
-            "CPU完整编码失败",
-        )
+        match self.kind {
+            EncoderType::JetsonGst => self.jetson_full_encode(
+                input_path,
+                info,
+                output_path,
+                params,
+                audio_plan,
+                max_bytes,
+                hw_slots,
+            ),
+            EncoderType::Gpu => self.gpu_encode(
+                input_path,
+                info,
+                output_path,
+                params,
+                audio_plan,
+                max_bytes,
+                hw_slots,
+            ),
+            _ => {
+                let (pre_args, video_args) = self.build_standard_ffmpeg_args(params);
+                let slots = self.kind.is_hardware().then_some(hw_slots).flatten();
+                let ctx = format!("{}编码失败", self.kind.short_id());
+                run_ffmpeg_watched(
+                    &pre_args,
+                    input_path,
+                    &video_args,
+                    info,
+                    audio_plan,
+                    output_path,
+                    max_bytes,
+                    slots,
+                    &ctx,
+                )
+            }
+        }
     }
-}
 
-// ============================================================================
-// 2. Desktop NVIDIA GPU Encoder (hevc_nvenc — zero-copy CUDA + fixed -bf/-b:v 0 + 10-bit)
-// ============================================================================
+    // ------------------------------------------------------------------------
+    // Standard FFmpeg backends (CPU, QSV, VAAPI, AMF, VideoToolbox)
+    // ------------------------------------------------------------------------
 
-impl GpuEncoder {
-    pub fn build_decode_args(&self, info: &VideoInfo, gpu_index: Option<usize>) -> Vec<String> {
+    fn build_standard_ffmpeg_args(&self, params: &EncodeParams) -> (Vec<String>, Vec<String>) {
+        match self.kind {
+            EncoderType::Cpu => {
+                let preset = if params.fast_preview {
+                    "fast"
+                } else {
+                    params.preset.as_str()
+                };
+                let mut args = vec_str(&[
+                    "-c:v",
+                    "libx265",
+                    "-crf",
+                    &params.quality.to_string(),
+                    "-preset",
+                    preset,
+                ]);
+                if params.ten_bit && self.caps.x265_10bit {
+                    args.extend(vec_str(&["-pix_fmt", "yuv420p10le"]));
+                }
+                args.extend(vec_str(&[
+                    "-x265-params",
+                    "aq-mode=3:limit-sao=1:deblock=-1,-1:log-level=error",
+                ]));
+                (vec![], args)
+            }
+            EncoderType::Qsv => {
+                let preset = if params.fast_preview { "fast" } else { "slow" };
+                let mut args = vec_str(&[
+                    "-c:v",
+                    "hevc_qsv",
+                    "-preset",
+                    preset,
+                    "-global_quality",
+                    &params.quality.to_string(),
+                    "-g",
+                    "240",
+                ]);
+                if params.ten_bit {
+                    args.extend(vec_str(&["-profile:v", "main10", "-pix_fmt", "p010le"]));
+                }
+                (vec![], args)
+            }
+            EncoderType::Vaapi => {
+                let device = self
+                    .caps
+                    .vaapi_device
+                    .as_deref()
+                    .unwrap_or("/dev/dri/renderD128");
+                let pre = vec_str(&["-vaapi_device", device]);
+                let args = vec_str(&[
+                    "-vf",
+                    "format=nv12,hwupload",
+                    "-c:v",
+                    "hevc_vaapi",
+                    "-rc_mode",
+                    "CQP",
+                    "-qp",
+                    &params.quality.to_string(),
+                    "-g",
+                    "240",
+                ]);
+                (pre, args)
+            }
+            EncoderType::Amf => {
+                let q = params.quality;
+                let quality_mode = if params.fast_preview {
+                    "balanced"
+                } else {
+                    "quality"
+                };
+                let args = vec_str(&[
+                    "-c:v",
+                    "hevc_amf",
+                    "-quality",
+                    quality_mode,
+                    "-rc",
+                    "cqp",
+                    "-qp_i",
+                    &q.saturating_sub(2).max(1).to_string(),
+                    "-qp_p",
+                    &q.to_string(),
+                    "-g",
+                    "240",
+                ]);
+                (vec![], args)
+            }
+            EncoderType::VideoToolbox => {
+                let vt_q = 100u8
+                    .saturating_sub(params.quality.saturating_mul(2))
+                    .clamp(20, 90);
+                let mut args = vec_str(&[
+                    "-c:v",
+                    "hevc_videotoolbox",
+                    "-q:v",
+                    &vt_q.to_string(),
+                    "-g",
+                    "240",
+                ]);
+                if params.ten_bit {
+                    args.extend(vec_str(&["-profile:v", "main10"]));
+                }
+                (vec![], args)
+            }
+            EncoderType::Gpu | EncoderType::JetsonGst => unreachable!(),
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Desktop NVIDIA NVENC (zero-copy CUDA decode with automatic SW fallback)
+    // ------------------------------------------------------------------------
+
+    fn build_gpu_decode_args(&self, info: &VideoInfo, gpu_index: Option<usize>) -> Vec<String> {
         if !info.is_nvdec_compatible() {
             return vec![];
         }
-        let mut args = vec![
-            "-hwaccel".to_string(),
-            "cuda".to_string(),
-            "-hwaccel_output_format".to_string(),
-            "cuda".to_string(),
-        ];
+        let mut args = vec_str(&["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]);
         if let Some(idx) = gpu_index {
-            args.push("-hwaccel_device".to_string());
-            args.push(idx.to_string());
+            args.extend(vec_str(&["-hwaccel_device", &idx.to_string()]));
         }
         args
     }
 
-    pub fn build_video_args(&self, params: &EncodeParams, using_cuda_frames: bool) -> Vec<String> {
+    fn build_gpu_video_args(&self, params: &EncodeParams, using_cuda_frames: bool) -> Vec<String> {
         let cq = params.quality.clamp(1, 51);
         let nvenc_preset = if params.fast_preview {
             "p4"
@@ -384,140 +410,62 @@ impl GpuEncoder {
             "hq"
         };
 
-        let mut args = vec![
-            "-c:v".to_string(),
-            "hevc_nvenc".to_string(),
-            "-preset".to_string(),
-            nvenc_preset.to_string(),
-            "-tune".to_string(),
-            tune.to_string(),
-            "-rc".to_string(),
-            "vbr".to_string(),
-            "-cq".to_string(),
-            cq.to_string(),
-            // CRITICAL: -b:v 0 enables true constant-quality VBR (previously `-b 4` forced 4 bps!).
-            "-b:v".to_string(),
-            "0".to_string(),
-            "-g".to_string(),
-            "240".to_string(),
-            "-rc-lookahead".to_string(),
-            "32".to_string(),
-            "-spatial_aq".to_string(),
-            "1".to_string(),
-            "-temporal_aq".to_string(),
-            "1".to_string(),
-            "-aq-strength".to_string(),
-            "8".to_string(),
-        ];
+        let mut args = vec_str(&[
+            "-c:v",
+            "hevc_nvenc",
+            "-preset",
+            nvenc_preset,
+            "-tune",
+            tune,
+            "-rc",
+            "vbr",
+            "-cq",
+            &cq.to_string(),
+            "-b:v",
+            "0",
+            "-g",
+            "240",
+            "-rc-lookahead",
+            "32",
+            "-spatial_aq",
+            "1",
+            "-temporal_aq",
+            "1",
+            "-aq-strength",
+            "8",
+        ]);
 
         if let Some(idx) = params.gpu_index {
-            args.push("-gpu".to_string());
-            args.push(idx.to_string());
+            args.extend(vec_str(&["-gpu", &idx.to_string()]));
         }
-
         if self.caps.nvenc_bframes {
-            args.push("-b_ref_mode".to_string());
-            args.push("middle".to_string());
-            args.push("-bf".to_string());
-            args.push("4".to_string());
+            args.extend(vec_str(&["-b_ref_mode", "middle", "-bf", "4"]));
         }
-
         if !params.fast_preview && self.caps.nvenc_multipass {
-            args.push("-multipass".to_string());
-            args.push("qres".to_string());
+            args.extend(vec_str(&["-multipass", "qres"]));
         }
-
         if params.ten_bit && self.caps.nvenc_10bit {
-            args.push("-profile:v".to_string());
-            args.push("main10".to_string());
+            args.extend(vec_str(&["-profile:v", "main10"]));
             if using_cuda_frames {
-                // Keep zero-copy CUDA frames on GPU and promote 8->10 bit inside NVENC.
-                args.push("-highbitdepth".to_string());
-                args.push("1".to_string());
+                args.extend(vec_str(&["-highbitdepth", "1"]));
             } else {
-                args.push("-pix_fmt".to_string());
-                args.push("p010le".to_string());
+                args.extend(vec_str(&["-pix_fmt", "p010le"]));
             }
         }
-
         if let Some(maxrate) = params.maxrate_kbps {
-            args.push("-maxrate".to_string());
-            args.push(format!("{}k", maxrate));
-            args.push("-bufsize".to_string());
-            args.push(format!("{}k", maxrate.saturating_mul(2)));
+            args.extend(vec_str(&[
+                "-maxrate",
+                &format!("{}k", maxrate),
+                "-bufsize",
+                &format!("{}k", maxrate.saturating_mul(2)),
+            ]));
         }
 
         args
     }
-}
 
-impl VideoEncoder for GpuEncoder {
-    fn encoder_type(&self) -> EncoderType {
-        EncoderType::Gpu
-    }
-
-    fn supports_10bit(&self) -> bool {
-        self.caps.nvenc_10bit
-    }
-
-    fn quality_profile(&self, max_crf: u8) -> QualityProfile {
-        let max_q = max_crf.clamp(24, 36);
-        QualityProfile {
-            min_q: 18,
-            anchor_q: 26.min(max_q),
-            max_q,
-            low_probe_delta: 4,
-        }
-    }
-
-    fn encode_sample(
-        &self,
-        sample_path: &Path,
-        sample_info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<u64> {
-        let decode_args = self.build_decode_args(sample_info, params.gpu_index);
-        let using_cuda = !decode_args.is_empty();
-        let video_args = self.build_video_args(params, using_cuda);
-        let res = run_ffmpeg_watched(
-            &decode_args,
-            sample_path,
-            &video_args,
-            sample_info,
-            AudioPlan::None,
-            output_path,
-            None,
-            hw_slots,
-            "GPU样本预览编码失败",
-        );
-        match res {
-            Ok(EncodeOutcome::Completed(sz)) => Ok(sz),
-            Ok(EncodeOutcome::AbortedSizeLimit { .. }) => unreachable!(),
-            Err(_) if using_cuda => {
-                // Graceful fallback to SW decode -> NVENC encode if CUDA decode fails on this stream.
-                let sw_video_args = self.build_video_args(params, false);
-                match run_ffmpeg_watched(
-                    &[],
-                    sample_path,
-                    &sw_video_args,
-                    sample_info,
-                    AudioPlan::None,
-                    output_path,
-                    None,
-                    hw_slots,
-                    "GPU样本预览编码失败(软解回退)",
-                )? {
-                    EncodeOutcome::Completed(sz) => Ok(sz),
-                    EncodeOutcome::AbortedSizeLimit { .. } => unreachable!(),
-                }
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn full_encode(
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_encode(
         &self,
         input_path: &Path,
         info: &VideoInfo,
@@ -527,9 +475,9 @@ impl VideoEncoder for GpuEncoder {
         max_bytes: Option<u64>,
         hw_slots: Option<&HwSlotPool>,
     ) -> Result<EncodeOutcome> {
-        let decode_args = self.build_decode_args(info, params.gpu_index);
+        let decode_args = self.build_gpu_decode_args(info, params.gpu_index);
         let using_cuda = !decode_args.is_empty();
-        let video_args = self.build_video_args(params, using_cuda);
+        let video_args = self.build_gpu_video_args(params, using_cuda);
         let res = run_ffmpeg_watched(
             &decode_args,
             input_path,
@@ -539,13 +487,15 @@ impl VideoEncoder for GpuEncoder {
             output_path,
             max_bytes,
             hw_slots,
-            "GPU完整编码失败",
+            "GPU编码失败",
         );
         match res {
             Ok(outcome) => Ok(outcome),
             Err(e) if using_cuda && !is_nvenc_session_limit_error(&e.to_string()) => {
-                log_info("  (NVDEC硬解不兼容此流，自动切回软解+NVENC硬编)");
-                let sw_video_args = self.build_video_args(params, false);
+                if !params.fast_preview {
+                    log_info("  (NVDEC硬解不兼容此流，自动切回软解+NVENC硬编)");
+                }
+                let sw_video_args = self.build_gpu_video_args(params, false);
                 run_ffmpeg_watched(
                     &[],
                     input_path,
@@ -555,21 +505,16 @@ impl VideoEncoder for GpuEncoder {
                     output_path,
                     max_bytes,
                     hw_slots,
-                    "GPU完整编码失败(软解回退)",
+                    "GPU编码失败(软解回退)",
                 )
             }
             Err(e) => Err(e),
         }
     }
-}
 
-// ============================================================================
-// 3. Official Jetson GStreamer Backend (nvv4l2h265enc 10-bit + nvv4l2decoder NVMM zero-copy)
-//    Zero custom-compiled FFmpeg required!
-// ============================================================================
-
-impl JetsonGstEncoder {
-    pub const MIN_DIMENSION: u32 = 160;
+    // ------------------------------------------------------------------------
+    // Official Jetson GStreamer Backend (nvv4l2h265enc 10-bit + NVMM zero-copy)
+    // ------------------------------------------------------------------------
 
     fn build_nvv4l2_enc_args(&self, params: &EncodeParams) -> Vec<String> {
         let qp = params.quality.clamp(16, 44);
@@ -582,9 +527,6 @@ impl JetsonGstEncoder {
             qp_p_min, qp_p_max, qp_i_min, qp_i_max, qp_p_min, qp_p_max
         );
 
-        // Empirically validated on Jetson Orin:
-        // - FastPreset (2) = ~142fps, ideal for rapid perceptual search samples
-        // - MediumPreset (3) == SlowPreset (4) in output quality/size (~80fps, beats libx265 CRF23!)
         let preset_level = if params.fast_preview {
             "2"
         } else {
@@ -598,12 +540,11 @@ impl JetsonGstEncoder {
         };
 
         let profile = if params.ten_bit && self.caps.jetson_gst_10bit {
-            "1" // Main10
+            "1"
         } else {
-            "0" // Main
+            "0"
         };
 
-        // Generous VBR bitrate ceiling so qp-range governs perceptual quality cleanly.
         let peak_bps: u64 = params
             .maxrate_kbps
             .map(|k| (k as u64).saturating_mul(1000).max(2_000_000))
@@ -615,7 +556,7 @@ impl JetsonGstEncoder {
             "maxperf-enable=1".to_string(),
             "iframeinterval=240".to_string(),
             format!("profile={}", profile),
-            "control-rate=0".to_string(), // variable_bitrate
+            "control-rate=0".to_string(),
             format!("preset-level={}", preset_level),
             format!("bitrate={}", avg_bps),
             format!("peak-bitrate={}", peak_bps),
@@ -623,164 +564,119 @@ impl JetsonGstEncoder {
         ]
     }
 
-    fn nvmm_caps(&self, params: &EncodeParams) -> String {
+    fn nvmm_caps(&self, params: &EncodeParams) -> &'static str {
         if params.ten_bit && self.caps.jetson_gst_10bit {
-            "video/x-raw(memory:NVMM),format=P010_10LE".to_string()
+            "video/x-raw(memory:NVMM),format=P010_10LE"
         } else {
-            "video/x-raw(memory:NVMM),format=NV12".to_string()
+            "video/x-raw(memory:NVMM),format=NV12"
         }
     }
 
-    /// Build the GStreamer parallel audio branch (`<parser/transcode> ! mp4mux`) so audio is
-    /// demuxed/transcoded in the EXACT SAME single sequential read pass as video (critical on NFS!).
-    fn build_gst_audio_branch(&self, info: &VideoInfo, audio_plan: AudioPlan) -> Option<Vec<String>> {
+    fn build_gst_audio_branch(
+        &self,
+        info: &VideoInfo,
+        audio_plan: AudioPlan,
+    ) -> Option<Vec<String>> {
         if !self.caps.jetson_gst_audio_mux || !info.has_audio {
             return None;
         }
         match audio_plan {
             AudioPlan::None => None,
             AudioPlan::Copy => {
-                let codec = info.audio_codec.as_deref()?.to_ascii_lowercase();
-                let parser = match codec.as_str() {
+                let parser = match info.audio_codec.as_deref()?.to_ascii_lowercase().as_str() {
                     "aac" => "aacparse",
                     "mp3" => "mpegaudioparse",
                     "ac3" | "eac3" => "ac3parse",
                     _ => return None,
                 };
-                Some(vec![parser.to_string(), "!".to_string(), "mp4mux".to_string()])
+                Some(vec_str(&[parser, "!", "mp4mux"]))
             }
-            AudioPlan::TranscodeAac(kbps) => Some(vec![
-                "decodebin".to_string(),
-                "!".to_string(),
-                "audioconvert".to_string(),
-                "!".to_string(),
-                "audioresample".to_string(),
-                "!".to_string(),
-                "avenc_aac".to_string(),
-                format!("bitrate={}", kbps.saturating_mul(1000)),
-                "!".to_string(),
-                "aacparse".to_string(),
-                "!".to_string(),
-                "mp4mux".to_string(),
-            ]),
+            AudioPlan::TranscodeAac(kbps) => Some(vec_str(&[
+                "decodebin",
+                "!",
+                "audioconvert",
+                "!",
+                "audioresample",
+                "!",
+                "avenc_aac",
+                &format!("bitrate={}", kbps.saturating_mul(1000)),
+                "!",
+                "aacparse",
+                "!",
+                "mp4mux",
+            ])),
         }
     }
 
-    /// Path A: Full NVMM zero-copy decode -> color/10-bit VIC -> NVENC H.265 -> Matroska (preserves PTS/VFR).
-    /// When `audio_branch` and `out_aud_m4a` are provided, demuxes & copies/transcodes audio
-    /// concurrently in the SAME single sequential input read (eliminates second full-file NFS read!).
     #[allow(clippy::too_many_arguments)]
-    fn run_zerocopy_encode(
+    fn jetson_run_zerocopy(
         &self,
         input_path: &Path,
         demux: &str,
         parser: &str,
         out_mkv: &Path,
-        audio_branch: Option<&[String]>,
-        out_aud_m4a: Option<&Path>,
+        audio_branch: Option<(&[String], &Path)>,
         params: &EncodeParams,
         max_bytes: Option<u64>,
         hw_slots: Option<&HwSlotPool>,
     ) -> Result<EncodeOutcome> {
         let mut cmd = Command::new("gst-launch-1.0");
         cmd.args(["-q", "-e", "filesrc"])
-            .arg(format!("location={}", input_path.to_string_lossy()));
+            .arg(format!("location={}", input_path.to_string_lossy()))
+            .args(["!", demux]);
 
-        if let (Some(abranch), Some(aud_path)) = (audio_branch, out_aud_m4a) {
-            // Single-pass dual-branch pipeline: NVENC video + parallel CPU audio into separate muxers.
-            cmd.args(["!", demux, "name=d"])
-                .args([
-                    "d.video_0",
-                    "!",
-                    "queue",
-                    "max-size-buffers=0",
-                    "max-size-time=0",
-                    "max-size-bytes=0",
-                    "!",
-                    parser,
-                    "!",
-                    "nvv4l2decoder",
-                    "!",
-                    "nvvidconv",
-                    "!",
-                ])
-                .arg(self.nvmm_caps(params))
-                .arg("!");
-            for arg in self.build_nvv4l2_enc_args(params) {
-                cmd.arg(arg);
-            }
-            cmd.args(["!", "h265parse", "!", "matroskamux", "!", "filesink"])
-                .arg(format!("location={}", out_mkv.to_string_lossy()))
-                .args([
-                    "d.audio_0",
-                    "!",
-                    "queue",
-                    "max-size-buffers=0",
-                    "max-size-time=0",
-                    "max-size-bytes=0",
-                    "!",
-                ]);
-            for arg in abranch {
-                cmd.arg(arg);
-            }
-            cmd.args(["!", "filesink"])
-                .arg(format!("location={}", aud_path.to_string_lossy()));
-        } else {
+        if audio_branch.is_some() {
             cmd.args([
+                "name=d",
+                "d.video_0",
                 "!",
-                demux,
+                "queue",
+                "max-size-buffers=0",
+                "max-size-time=0",
+                "max-size-bytes=0",
+            ]);
+        }
+
+        cmd.args([
+            "!",
+            parser,
+            "!",
+            "nvv4l2decoder",
+            "!",
+            "nvvidconv",
+            "!",
+            self.nvmm_caps(params),
+            "!",
+        ])
+        .args(self.build_nvv4l2_enc_args(params))
+        .args(["!", "h265parse", "!", "matroskamux", "!", "filesink"])
+        .arg(format!("location={}", out_mkv.to_string_lossy()));
+
+        if let Some((abranch, aud_path)) = audio_branch {
+            cmd.args([
+                "d.audio_0",
                 "!",
-                parser,
-                "!",
-                "nvv4l2decoder",
-                "!",
-                "nvvidconv",
+                "queue",
+                "max-size-buffers=0",
+                "max-size-time=0",
+                "max-size-bytes=0",
                 "!",
             ])
-            .arg(self.nvmm_caps(params))
-            .arg("!");
-            for arg in self.build_nvv4l2_enc_args(params) {
-                cmd.arg(arg);
-            }
-            cmd.args(["!", "h265parse", "!", "matroskamux", "!", "filesink"])
-                .arg(format!("location={}", out_mkv.to_string_lossy()));
+            .args(abranch)
+            .args(["!", "filesink"])
+            .arg(format!("location={}", aud_path.to_string_lossy()));
         }
 
-        let watchdog = max_bytes.map(|limit| SizeWatchdog {
-            watch_path: out_mkv,
-            max_bytes: limit,
-        });
-
+        let watchdog = make_watchdog(out_mkv, max_bytes);
         let outcome = {
-            let _permit = hw_slots.map(|pool| pool.acquire());
+            let _permit = hw_slots.map(HwSlotPool::acquire);
             run_command_watched(&mut cmd, watchdog, "Jetson GStreamer零拷贝硬编失败")?
         };
-
-        match outcome {
-            WatchedOutcome::SizeLimitExceeded { written_bytes } => {
-                Ok(EncodeOutcome::AbortedSizeLimit { written_bytes })
-            }
-            WatchedOutcome::Finished(out) => {
-                if !out.status.success() {
-                    anyhow::bail!("Jetson GStreamer零拷贝硬编失败: {}", stderr_tail(&out));
-                }
-                let size = std::fs::metadata(out_mkv)
-                    .context("无法读取GStreamer输出文件")?
-                    .len();
-                if size == 0 {
-                    anyhow::bail!("Jetson GStreamer输出为空");
-                }
-                Ok(EncodeOutcome::Completed(size))
-            }
-        }
+        finish_watched_encode(outcome, out_mkv, true, "Jetson GStreamer零拷贝硬编失败")
     }
 
-    /// Path B: Universal compatibility pipe — standard FFmpeg SW decode (I420, CFR, even dims, noautorotate)
-    /// -> OS pipe -> GStreamer `fdsrc ! rawvideoparse format=i420 ! nvvidconv(NVMM) ! nvv4l2h265enc ! matroskamux`.
-    /// When `out_aud_m4a` is provided, FFmpeg writes the audio track as a second output during the
-    /// SAME single input read!
     #[allow(clippy::too_many_arguments)]
-    fn run_pipe_encode(
+    fn jetson_run_pipe(
         &self,
         input_path: &Path,
         info: &VideoInfo,
@@ -791,10 +687,12 @@ impl JetsonGstEncoder {
         max_bytes: Option<u64>,
         hw_slots: Option<&HwSlotPool>,
     ) -> Result<EncodeOutcome> {
-        let even_w = (info.width + (info.width % 2)).max(Self::MIN_DIMENSION);
-        let even_h = (info.height + (info.height % 2)).max(Self::MIN_DIMENSION);
-        let fps_num = (info.fps.clamp(1.0, 240.0) * 1000.0).round() as u32;
-        let fps_str = format!("{}/1000", fps_num);
+        let even_w = (info.width + (info.width % 2)).max(Self::JETSON_MIN_DIMENSION);
+        let even_h = (info.height + (info.height % 2)).max(Self::JETSON_MIN_DIMENSION);
+        let fps_str = format!(
+            "{}/1000",
+            (info.fps.clamp(1.0, 240.0) * 1000.0).round() as u32
+        );
 
         let mut producer = Command::new("ffmpeg");
         producer
@@ -806,7 +704,7 @@ impl JetsonGstEncoder {
         }
         producer.args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]);
 
-        // Second output in the same FFmpeg process: extract/transcode audio in one pass!
+        // Second output in the same FFmpeg process: extract/transcode audio in one pass.
         if let Some(aud_path) = out_aud_m4a
             && info.has_audio
             && !matches!(audio_plan, AudioPlan::None)
@@ -831,23 +729,16 @@ impl JetsonGstEncoder {
                 "!",
                 "nvvidconv",
                 "!",
+                self.nvmm_caps(params),
+                "!",
             ])
-            .arg(self.nvmm_caps(params))
-            .arg("!");
-        for arg in self.build_nvv4l2_enc_args(params) {
-            consumer.arg(arg);
-        }
-        consumer
+            .args(self.build_nvv4l2_enc_args(params))
             .args(["!", "h265parse", "!", "matroskamux", "!", "filesink"])
             .arg(format!("location={}", out_mkv.to_string_lossy()));
 
-        let watchdog = max_bytes.map(|limit| SizeWatchdog {
-            watch_path: out_mkv,
-            max_bytes: limit,
-        });
-
+        let watchdog = make_watchdog(out_mkv, max_bytes);
         let outcome = {
-            let _permit = hw_slots.map(|pool| pool.acquire());
+            let _permit = hw_slots.map(HwSlotPool::acquire);
             run_pipeline_watched(
                 &mut producer,
                 &mut consumer,
@@ -855,28 +746,11 @@ impl JetsonGstEncoder {
                 "Jetson软解管道+硬件编码失败",
             )?
         };
-
-        match outcome {
-            WatchedOutcome::SizeLimitExceeded { written_bytes } => {
-                Ok(EncodeOutcome::AbortedSizeLimit { written_bytes })
-            }
-            WatchedOutcome::Finished(out) => {
-                if !out.status.success() {
-                    anyhow::bail!("Jetson软解管道+硬件编码失败: {}", stderr_tail(&out));
-                }
-                let size = std::fs::metadata(out_mkv)
-                    .context("无法读取GStreamer管道输出")?
-                    .len();
-                if size == 0 {
-                    anyhow::bail!("Jetson GStreamer管道输出为空");
-                }
-                Ok(EncodeOutcome::Completed(size))
-            }
-        }
+        finish_watched_encode(outcome, out_mkv, true, "Jetson软解管道+硬件编码失败")
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn encode_video_track(
+    fn jetson_encode_video_track(
         &self,
         input_path: &Path,
         info: &VideoInfo,
@@ -887,26 +761,23 @@ impl JetsonGstEncoder {
         max_bytes: Option<u64>,
         hw_slots: Option<&HwSlotPool>,
     ) -> Result<EncodeOutcome> {
-        // GStreamer `filesrc location=...` parses pipeline tokens directly; route exotic paths
-        // containing `!` or quotes safely through Path B (FFmpeg stdin pipe).
         let path_safe_for_gst = input_path
             .to_str()
-            .map(|s| !s.contains('!') && !s.contains('"') && !s.contains('\''))
-            .unwrap_or(false);
+            .is_some_and(|s| !s.contains('!') && !s.contains('"') && !s.contains('\''));
 
         if path_safe_for_gst
             && self.caps.jetson_gst_decoder
             && let Some((demux, parser)) = info.gst_zerocopy_elements()
         {
-            let audio_branch = out_aud_m4a.and_then(|_| self.build_gst_audio_branch(info, audio_plan));
-            if let Some(ref abranch) = audio_branch {
-                match self.run_zerocopy_encode(
+            if let Some(aud_path) = out_aud_m4a
+                && let Some(abranch) = self.build_gst_audio_branch(info, audio_plan)
+            {
+                match self.jetson_run_zerocopy(
                     input_path,
                     demux,
                     parser,
                     out_mkv,
-                    Some(abranch.as_slice()),
-                    out_aud_m4a,
+                    Some((abranch.as_slice(), aud_path)),
                     params,
                     max_bytes,
                     hw_slots,
@@ -918,15 +789,13 @@ impl JetsonGstEncoder {
                             e
                         ));
                         let _ = std::fs::remove_file(out_mkv);
-                        if let Some(p) = out_aud_m4a {
-                            let _ = std::fs::remove_file(p);
-                        }
+                        let _ = std::fs::remove_file(aud_path);
                     }
                 }
             }
 
-            match self.run_zerocopy_encode(
-                input_path, demux, parser, out_mkv, None, None, params, max_bytes, hw_slots,
+            match self.jetson_run_zerocopy(
+                input_path, demux, parser, out_mkv, None, params, max_bytes, hw_slots,
             ) {
                 Ok(outcome) => return Ok(outcome),
                 Err(e) => {
@@ -939,7 +808,7 @@ impl JetsonGstEncoder {
             }
         }
 
-        self.run_pipe_encode(
+        self.jetson_run_pipe(
             input_path,
             info,
             out_mkv,
@@ -951,129 +820,8 @@ impl JetsonGstEncoder {
         )
     }
 
-    /// Standard FFmpeg remux: millisecond-fast pure `-c copy` when audio was extracted in-pass
-    /// (zero second NFS read!), falling back seamlessly to original input audio if needed.
-    fn remux_to_mp4(
-        video_mkv: &Path,
-        pre_extracted_audio: Option<&Path>,
-        original_input: &Path,
-        info: &VideoInfo,
-        audio_plan: AudioPlan,
-        output_mp4: &Path,
-    ) -> Result<u64> {
-        let valid_local_audio = pre_extracted_audio.filter(|p| {
-            !matches!(audio_plan, AudioPlan::None)
-                && std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
-                && probe_has_audio(p)
-        });
-
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-y", "-hide_banner", "-v", "error"]);
-        if info.rotation != 0 {
-            cmd.arg("-display_rotation:v:0")
-                .arg(info.rotation.to_string());
-        }
-
-        if let Some(aud_path) = valid_local_audio {
-            // FAST PATH: both video & audio are already local on SSD -> pure `-c copy`!
-            // `original_input` is only opened for container metadata header (never scans payloads!).
-            log_debug("  [合流优化] 命中单遍分流本地音频轨，纯 -c copy 极速合流 (免二次通读源文件)");
-            cmd.arg("-i")
-                .arg(video_mkv)
-                .arg("-i")
-                .arg(aud_path)
-                .arg("-i")
-                .arg(original_input)
-                .args([
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a:0",
-                    "-c",
-                    "copy",
-                    "-tag:v",
-                    "hvc1",
-                ]);
-            append_color_tags(&mut cmd, info);
-            cmd.args(["-map_metadata", "2", "-movflags", "+faststart"])
-                .arg(output_mp4);
-        } else {
-            // Fallback: read audio directly from original_input (e.g. AudioPlan::None or exotic codec).
-            cmd.arg("-i")
-                .arg(video_mkv)
-                .arg("-i")
-                .arg(original_input)
-                .args(["-map", "0:v:0"]);
-            if !matches!(audio_plan, AudioPlan::None) {
-                cmd.args(["-map", "1:a:0?"]);
-            }
-            cmd.args(["-c:v", "copy", "-tag:v", "hvc1"]);
-            append_color_tags(&mut cmd, info);
-            audio_plan.append_ffmpeg_args(&mut cmd);
-            cmd.args(["-map_metadata", "1", "-movflags", "+faststart"])
-                .arg(output_mp4);
-        }
-
-        let out = run_command_cancellable(&mut cmd, "FFmpeg合流封装MP4失败")?;
-        if !out.status.success() {
-            anyhow::bail!("FFmpeg合流封装MP4失败: {}", stderr_tail(&out));
-        }
-
-        Ok(std::fs::metadata(output_mp4)
-            .context("无法读取最终封装MP4")?
-            .len())
-    }
-}
-
-impl VideoEncoder for JetsonGstEncoder {
-    fn encoder_type(&self) -> EncoderType {
-        EncoderType::JetsonGst
-    }
-
-    fn supports_video(&self, info: &VideoInfo) -> bool {
-        info.width >= Self::MIN_DIMENSION && info.height >= Self::MIN_DIMENSION
-    }
-
-    fn supports_10bit(&self) -> bool {
-        self.caps.jetson_gst_10bit
-    }
-
-    fn quality_profile(&self, max_crf: u8) -> QualityProfile {
-        // Empirically calibrated on Jetson Orin nvv4l2h265enc 10-bit:
-        // QP 28-32 is the visual transparency sweet spot; cap strictly to preserve quality.
-        let max_q = max_crf.clamp(26, 36);
-        QualityProfile {
-            min_q: 22,
-            anchor_q: 28.min(max_q),
-            max_q,
-            low_probe_delta: 4,
-        }
-    }
-
-    fn encode_sample(
-        &self,
-        sample_path: &Path,
-        sample_info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<u64> {
-        match self.encode_video_track(
-            sample_path,
-            sample_info,
-            output_path,
-            AudioPlan::None,
-            None,
-            params,
-            None,
-            hw_slots,
-        )? {
-            EncodeOutcome::Completed(sz) => Ok(sz),
-            EncodeOutcome::AbortedSizeLimit { .. } => unreachable!(),
-        }
-    }
-
-    fn full_encode(
+    #[allow(clippy::too_many_arguments)]
+    fn jetson_full_encode(
         &self,
         input_path: &Path,
         info: &VideoInfo,
@@ -1083,7 +831,6 @@ impl VideoEncoder for JetsonGstEncoder {
         max_bytes: Option<u64>,
         hw_slots: Option<&HwSlotPool>,
     ) -> Result<EncodeOutcome> {
-        // Stage 1 (holds HW slot): single-pass hardware video encode + parallel local audio demux/transcode.
         let tmp_mkv = NamedTempFile::with_suffix(".mkv").context("无法创建临时视频轨文件")?;
         let tmp_aud = if info.has_audio && !matches!(audio_plan, AudioPlan::None) {
             Some(NamedTempFile::with_suffix(".m4a").context("无法创建临时音频轨文件")?)
@@ -1091,7 +838,7 @@ impl VideoEncoder for JetsonGstEncoder {
             None
         };
 
-        let mkv_outcome = self.encode_video_track(
+        match self.jetson_encode_video_track(
             input_path,
             info,
             tmp_mkv.path(),
@@ -1100,15 +847,12 @@ impl VideoEncoder for JetsonGstEncoder {
             params,
             max_bytes,
             hw_slots,
-        )?;
-
-        match mkv_outcome {
+        )? {
             EncodeOutcome::AbortedSizeLimit { written_bytes } => {
                 Ok(EncodeOutcome::AbortedSizeLimit { written_bytes })
             }
             EncodeOutcome::Completed(_) => {
-                // Stage 2 (HW slot already released!): pure local -c copy remux to MP4.
-                let final_size = Self::remux_to_mp4(
+                let final_size = jetson_remux_to_mp4(
                     tmp_mkv.path(),
                     tmp_aud.as_ref().map(|f| f.path()),
                     input_path,
@@ -1122,496 +866,176 @@ impl VideoEncoder for JetsonGstEncoder {
     }
 }
 
-// ============================================================================
-// 4. Legacy Jetson NVMPI Backend (kept as opt-in/fallback; bitrate bugs fixed)
-// ============================================================================
+fn jetson_remux_to_mp4(
+    video_mkv: &Path,
+    pre_extracted_audio: Option<&Path>,
+    original_input: &Path,
+    info: &VideoInfo,
+    audio_plan: AudioPlan,
+    output_mp4: &Path,
+) -> Result<u64> {
+    let valid_local_audio = pre_extracted_audio.filter(|p| {
+        !matches!(audio_plan, AudioPlan::None)
+            && std::fs::metadata(p).is_ok_and(|m| m.len() > 0)
+            && probe_has_audio(p)
+    });
 
-impl JetsonNvmpiEncoder {
-    pub const MIN_DIMENSION: u32 = 160;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-hide_banner", "-v", "error"]);
+    if info.rotation != 0 {
+        cmd.args(["-display_rotation:v:0", &info.rotation.to_string()]);
+    }
 
-    fn build_video_args(&self, params: &EncodeParams) -> Vec<String> {
-        let target_kbps = params.target_bitrate_kbps.unwrap_or(match params.quality {
-            18..=22 => 2000,
-            23..=26 => 1400,
-            27..=30 => 1000,
-            _ => 750,
-        });
-
-        let mut args = vec![
-            "-c:v".to_string(),
-            "hevc_nvmpi".to_string(),
-            "-rc".to_string(),
-            "vbr".to_string(),
-            "-b:v".to_string(),
-            format!("{}k", target_kbps),
-        ];
-
-        // Avoid pseudo-CBR: only set maxrate when strictly greater than target_bitrate.
-        if let Some(maxrate) = params.maxrate_kbps {
-            let safe_max = maxrate.max(target_kbps.saturating_mul(13) / 10);
-            args.push("-maxrate".to_string());
-            args.push(format!("{}k", safe_max));
-            args.push("-bufsize".to_string());
-            args.push(format!("{}k", safe_max.saturating_mul(2)));
+    cmd.arg("-i").arg(video_mkv);
+    let metadata_src_idx = if let Some(aud_path) = valid_local_audio {
+        log_debug("  [合流优化] 命中单遍分流本地音频轨，纯 -c copy 极速合流 (免二次通读源文件)");
+        cmd.arg("-i")
+            .arg(aud_path)
+            .arg("-i")
+            .arg(original_input)
+            .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"]);
+        "2"
+    } else {
+        cmd.arg("-i").arg(original_input).args(["-map", "0:v:0"]);
+        if !matches!(audio_plan, AudioPlan::None) {
+            cmd.args(["-map", "1:a:0?"]);
         }
+        cmd.args(["-c:v", "copy"]);
+        audio_plan.append_ffmpeg_args(&mut cmd);
+        "1"
+    };
 
-        args
-    }
-}
+    cmd.args(["-tag:v", "hvc1"]);
+    append_color_tags(&mut cmd, info);
+    cmd.args(["-map_metadata", metadata_src_idx, "-movflags", "+faststart"])
+        .arg(output_mp4);
 
-impl VideoEncoder for JetsonNvmpiEncoder {
-    fn encoder_type(&self) -> EncoderType {
-        EncoderType::JetsonNvmpi
+    let out = run_command_cancellable(&mut cmd, "FFmpeg合流封装MP4失败")?;
+    if !out.status.success() {
+        anyhow::bail!("FFmpeg合流封装MP4失败: {}", stderr_tail(&out));
     }
-
-    fn supports_video(&self, info: &VideoInfo) -> bool {
-        info.width >= Self::MIN_DIMENSION && info.height >= Self::MIN_DIMENSION
-    }
-
-    fn supports_quality_search(&self) -> bool {
-        false
-    }
-
-    fn quality_profile(&self, max_crf: u8) -> QualityProfile {
-        QualityProfile {
-            min_q: 20,
-            anchor_q: 24,
-            max_q: max_crf.clamp(24, 32),
-            low_probe_delta: 4,
-        }
-    }
-
-    fn encode_sample(
-        &self,
-        sample_path: &Path,
-        sample_info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<u64> {
-        let video_args = self.build_video_args(params);
-        match run_ffmpeg_watched(
-            &[],
-            sample_path,
-            &video_args,
-            sample_info,
-            AudioPlan::None,
-            output_path,
-            None,
-            hw_slots,
-            "NVMPI样本编码失败",
-        )? {
-            EncodeOutcome::Completed(sz) => Ok(sz),
-            EncodeOutcome::AbortedSizeLimit { .. } => unreachable!(),
-        }
-    }
-
-    fn full_encode(
-        &self,
-        input_path: &Path,
-        info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        audio_plan: AudioPlan,
-        max_bytes: Option<u64>,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<EncodeOutcome> {
-        let video_args = self.build_video_args(params);
-        run_ffmpeg_watched(
-            &[],
-            input_path,
-            &video_args,
-            info,
-            audio_plan,
-            output_path,
-            max_bytes,
-            hw_slots,
-            "NVMPI完整编码失败",
-        )
-    }
+    Ok(std::fs::metadata(output_mp4)
+        .context("无法读取最终封装MP4")?
+        .len())
 }
 
 // ============================================================================
-// 5. Cross-platform Hardware Encoders: Intel QSV, VA-API, AMD AMF, Apple VideoToolbox
+// Shared FFmpeg command helpers
 // ============================================================================
 
-impl VideoEncoder for QsvEncoder {
-    fn encoder_type(&self) -> EncoderType {
-        EncoderType::Qsv
-    }
-
-    fn supports_10bit(&self) -> bool {
-        true
-    }
-
-    fn quality_profile(&self, max_crf: u8) -> QualityProfile {
-        let max_q = max_crf.clamp(24, 34);
-        QualityProfile {
-            min_q: 18,
-            anchor_q: 25.min(max_q),
-            max_q,
-            low_probe_delta: 4,
-        }
-    }
-
-    fn encode_sample(
-        &self,
-        sample_path: &Path,
-        sample_info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<u64> {
-        let preset = if params.fast_preview { "fast" } else { "slow" };
-        let args = vec![
-            "-c:v".into(),
-            "hevc_qsv".into(),
-            "-preset".into(),
-            preset.into(),
-            "-global_quality".into(),
-            params.quality.to_string(),
-            "-g".into(),
-            "240".into(),
-        ];
-        match run_ffmpeg_watched(
-            &[],
-            sample_path,
-            &args,
-            sample_info,
-            AudioPlan::None,
-            output_path,
-            None,
-            hw_slots,
-            "QSV样本预览编码失败",
-        )? {
-            EncodeOutcome::Completed(sz) => Ok(sz),
-            EncodeOutcome::AbortedSizeLimit { .. } => unreachable!(),
-        }
-    }
-
-    fn full_encode(
-        &self,
-        input_path: &Path,
-        info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        audio_plan: AudioPlan,
-        max_bytes: Option<u64>,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<EncodeOutcome> {
-        let mut args = vec![
-            "-c:v".into(),
-            "hevc_qsv".into(),
-            "-preset".into(),
-            "slow".into(),
-            "-global_quality".into(),
-            params.quality.to_string(),
-            "-g".into(),
-            "240".into(),
-        ];
-        if params.ten_bit {
-            args.push("-profile:v".into());
-            args.push("main10".into());
-            args.push("-pix_fmt".into());
-            args.push("p010le".into());
-        }
-        run_ffmpeg_watched(
-            &[],
-            input_path,
-            &args,
-            info,
-            audio_plan,
-            output_path,
-            max_bytes,
-            hw_slots,
-            "QSV完整编码失败",
-        )
-    }
+fn vec_str(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_string()).collect()
 }
 
-impl VideoEncoder for VaapiEncoder {
-    fn encoder_type(&self) -> EncoderType {
-        EncoderType::Vaapi
-    }
-
-    fn quality_profile(&self, max_crf: u8) -> QualityProfile {
-        let max_q = max_crf.clamp(24, 34);
-        QualityProfile {
-            min_q: 18,
-            anchor_q: 26.min(max_q),
-            max_q,
-            low_probe_delta: 4,
-        }
-    }
-
-    fn encode_sample(
-        &self,
-        sample_path: &Path,
-        sample_info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<u64> {
-        let pre = vec!["-vaapi_device".into(), self.device.clone()];
-        let args = vec![
-            "-vf".into(),
-            "format=nv12,hwupload".into(),
-            "-c:v".into(),
-            "hevc_vaapi".into(),
-            "-rc_mode".into(),
-            "CQP".into(),
-            "-qp".into(),
-            params.quality.to_string(),
-            "-g".into(),
-            "240".into(),
-        ];
-        match run_ffmpeg_watched(
-            &pre,
-            sample_path,
-            &args,
-            sample_info,
-            AudioPlan::None,
-            output_path,
-            None,
-            hw_slots,
-            "VAAPI样本预览编码失败",
-        )? {
-            EncodeOutcome::Completed(sz) => Ok(sz),
-            EncodeOutcome::AbortedSizeLimit { .. } => unreachable!(),
-        }
-    }
-
-    fn full_encode(
-        &self,
-        input_path: &Path,
-        info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        audio_plan: AudioPlan,
-        max_bytes: Option<u64>,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<EncodeOutcome> {
-        let pre = vec!["-vaapi_device".into(), self.device.clone()];
-        let args = vec![
-            "-vf".into(),
-            "format=nv12,hwupload".into(),
-            "-c:v".into(),
-            "hevc_vaapi".into(),
-            "-rc_mode".into(),
-            "CQP".into(),
-            "-qp".into(),
-            params.quality.to_string(),
-            "-g".into(),
-            "240".into(),
-        ];
-        run_ffmpeg_watched(
-            &pre,
-            input_path,
-            &args,
-            info,
-            audio_plan,
-            output_path,
-            max_bytes,
-            hw_slots,
-            "VAAPI完整编码失败",
-        )
-    }
+fn make_watchdog(watch_path: &Path, max_bytes: Option<u64>) -> Option<SizeWatchdog<'_>> {
+    max_bytes.map(|limit| SizeWatchdog {
+        watch_path,
+        max_bytes: limit,
+    })
 }
 
-impl VideoEncoder for AmfEncoder {
-    fn encoder_type(&self) -> EncoderType {
-        EncoderType::Amf
-    }
-
-    fn quality_profile(&self, max_crf: u8) -> QualityProfile {
-        let max_q = max_crf.clamp(24, 34);
-        QualityProfile {
-            min_q: 18,
-            anchor_q: 26.min(max_q),
-            max_q,
-            low_probe_delta: 4,
+fn finish_watched_encode(
+    outcome: WatchedOutcome,
+    output_path: &Path,
+    require_non_empty: bool,
+    context_msg: &str,
+) -> Result<EncodeOutcome> {
+    match outcome {
+        WatchedOutcome::SizeLimitExceeded { written_bytes } => {
+            Ok(EncodeOutcome::AbortedSizeLimit { written_bytes })
         }
-    }
-
-    fn encode_sample(
-        &self,
-        sample_path: &Path,
-        sample_info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<u64> {
-        let q = params.quality;
-        let args = vec![
-            "-c:v".into(),
-            "hevc_amf".into(),
-            "-quality".into(),
-            if params.fast_preview {
-                "balanced"
-            } else {
-                "quality"
+        WatchedOutcome::Finished(out) => {
+            if !out.status.success() {
+                anyhow::bail!("{}: {}", context_msg, stderr_tail(&out));
             }
-            .into(),
-            "-rc".into(),
-            "cqp".into(),
-            "-qp_i".into(),
-            q.saturating_sub(2).max(1).to_string(),
-            "-qp_p".into(),
-            q.to_string(),
-            "-g".into(),
-            "240".into(),
-        ];
-        match run_ffmpeg_watched(
-            &[],
-            sample_path,
-            &args,
-            sample_info,
-            AudioPlan::None,
-            output_path,
-            None,
-            hw_slots,
-            "AMF样本预览编码失败",
-        )? {
-            EncodeOutcome::Completed(sz) => Ok(sz),
-            EncodeOutcome::AbortedSizeLimit { .. } => unreachable!(),
+            let size = std::fs::metadata(output_path)
+                .context("无法读取编码输出文件")?
+                .len();
+            if require_non_empty && size == 0 {
+                anyhow::bail!("{}: 输出文件为空", context_msg);
+            }
+            Ok(EncodeOutcome::Completed(size))
         }
-    }
-
-    fn full_encode(
-        &self,
-        input_path: &Path,
-        info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        audio_plan: AudioPlan,
-        max_bytes: Option<u64>,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<EncodeOutcome> {
-        let q = params.quality;
-        let args = vec![
-            "-c:v".into(),
-            "hevc_amf".into(),
-            "-quality".into(),
-            "quality".into(),
-            "-rc".into(),
-            "cqp".into(),
-            "-qp_i".into(),
-            q.saturating_sub(2).max(1).to_string(),
-            "-qp_p".into(),
-            q.to_string(),
-            "-g".into(),
-            "240".into(),
-        ];
-        run_ffmpeg_watched(
-            &[],
-            input_path,
-            &args,
-            info,
-            audio_plan,
-            output_path,
-            max_bytes,
-            hw_slots,
-            "AMF完整编码失败",
-        )
     }
 }
 
-impl VideoEncoder for VideoToolboxEncoder {
-    fn encoder_type(&self) -> EncoderType {
-        EncoderType::VideoToolbox
+/// Map x265-style presets (or direct `p1`..`p7`) to NVENC presets.
+pub fn map_nvenc_preset(preset: &str) -> &'static str {
+    match preset.to_lowercase().as_str() {
+        "p1" | "ultrafast" | "superfast" => "p1",
+        "p2" | "veryfast" => "p2",
+        "p3" | "faster" => "p3",
+        "p4" | "fast" => "p4",
+        "p5" | "medium" => "p5",
+        "p6" | "slow" => "p6",
+        "p7" | "slower" | "veryslow" => "p7",
+        _ => "p6",
     }
+}
 
-    fn supports_10bit(&self) -> bool {
-        true
-    }
+fn stderr_tail(output: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr);
+    let mut lines: Vec<&str> = text.lines().rev().take(15).collect();
+    lines.reverse();
+    lines.join("\n")
+}
 
-    fn quality_profile(&self, _max_crf: u8) -> QualityProfile {
-        // VideoToolbox `-q:v` is inverted (1..100, higher=better); map internal `q`
-        // via `vt_q = 100 - q * 2` so higher `q` consistently means smaller output!
-        QualityProfile {
-            min_q: 12,
-            anchor_q: 20,
-            max_q: 30,
-            low_probe_delta: 4,
-        }
+fn append_color_tags(cmd: &mut Command, info: &VideoInfo) {
+    if let Some(cp) = &info.color_primaries {
+        cmd.args(["-color_primaries", cp]);
     }
+    if let Some(ct) = &info.color_transfer {
+        cmd.args(["-color_trc", ct]);
+    }
+    if let Some(cs) = &info.color_space {
+        cmd.args(["-colorspace", cs]);
+    }
+}
 
-    fn encode_sample(
-        &self,
-        sample_path: &Path,
-        sample_info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<u64> {
-        let vt_q = 100u8
-            .saturating_sub(params.quality.saturating_mul(2))
-            .clamp(20, 90);
-        let args = vec![
-            "-c:v".into(),
-            "hevc_videotoolbox".into(),
-            "-q:v".into(),
-            vt_q.to_string(),
-            "-g".into(),
-            "240".into(),
-        ];
-        match run_ffmpeg_watched(
-            &[],
-            sample_path,
-            &args,
-            sample_info,
-            AudioPlan::None,
-            output_path,
-            None,
-            hw_slots,
-            "VideoToolbox样本预览编码失败",
-        )? {
-            EncodeOutcome::Completed(sz) => Ok(sz),
-            EncodeOutcome::AbortedSizeLimit { .. } => unreachable!(),
-        }
+#[allow(clippy::too_many_arguments)]
+fn run_ffmpeg_watched(
+    pre_input_args: &[String],
+    input_path: &Path,
+    video_args: &[String],
+    info: &VideoInfo,
+    audio_plan: AudioPlan,
+    output_path: &Path,
+    max_bytes: Option<u64>,
+    hw_slots: Option<&HwSlotPool>,
+    context_msg: &str,
+) -> Result<EncodeOutcome> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-hide_banner", "-v", "error"])
+        .args(pre_input_args)
+        .arg("-i")
+        .arg(input_path)
+        .args(["-map", "0:v:0"]);
+    if !matches!(audio_plan, AudioPlan::None) {
+        cmd.args(["-map", "0:a:0?"]);
     }
+    cmd.args(video_args);
+    append_color_tags(&mut cmd, info);
+    audio_plan.append_ffmpeg_args(&mut cmd);
+    cmd.args([
+        "-map_metadata",
+        "0",
+        "-tag:v",
+        "hvc1",
+        "-movflags",
+        "+faststart",
+    ])
+    .arg(output_path);
 
-    fn full_encode(
-        &self,
-        input_path: &Path,
-        info: &VideoInfo,
-        output_path: &Path,
-        params: &EncodeParams,
-        audio_plan: AudioPlan,
-        max_bytes: Option<u64>,
-        hw_slots: Option<&HwSlotPool>,
-    ) -> Result<EncodeOutcome> {
-        let vt_q = 100u8
-            .saturating_sub(params.quality.saturating_mul(2))
-            .clamp(20, 90);
-        let mut args = vec![
-            "-c:v".into(),
-            "hevc_videotoolbox".into(),
-            "-q:v".into(),
-            vt_q.to_string(),
-            "-g".into(),
-            "240".into(),
-        ];
-        if params.ten_bit {
-            args.push("-profile:v".into());
-            args.push("main10".into());
-        }
-        run_ffmpeg_watched(
-            &[],
-            input_path,
-            &args,
-            info,
-            audio_plan,
-            output_path,
-            max_bytes,
-            hw_slots,
-            "VideoToolbox完整编码失败",
-        )
-    }
+    let watchdog = make_watchdog(output_path, max_bytes);
+    let outcome = {
+        let _permit = hw_slots.map(HwSlotPool::acquire);
+        run_command_watched(&mut cmd, watchdog, context_msg)?
+    };
+    finish_watched_encode(outcome, output_path, false, context_msg)
 }
 
 // ============================================================================
-// Single-Command Pure-Video Reference Sample Extraction (replaces 14-process loop!)
+// Single-Command Pure-Video Reference Sample Extraction
 // ============================================================================
 
 /// Extracted near-lossless pure-video reference sample for perceptual search.
@@ -1621,11 +1045,7 @@ pub struct ReferenceSample {
     pub info: VideoInfo,
 }
 
-/// Extract a representative pure-video (`-an`) reference sample in ONE FFmpeg command:
-/// - Short videos (`<= 18s`): up to 6s from the middle (or full clip if `<= 8s`).
-/// - Longer videos (`> 18s`): 3 uniform 2s segments at 20%, 50%, 80% (6s total), concatenated
-///   cleanly into a single near-lossless H.264 MP4 (`crf 12`, `ultrafast`) so hardware decoders
-///   (`nvv4l2decoder`, CUDA NVDEC) can decode it at 150+ fps during every search iteration.
+/// Extract a representative pure-video (`-an`) reference sample in ONE FFmpeg command.
 pub fn extract_reference_sample(
     input_path: &Path,
     info: &VideoInfo,
@@ -1653,7 +1073,6 @@ pub fn extract_reference_sample(
     let mut extracted_ok = false;
 
     if dur > 18.0 {
-        // 3 uniform segments x 2s = 6s at 20%, 50%, 80% in ONE FFmpeg command!
         let starts = [
             (dur * 0.20 - 1.0).max(0.0),
             (dur * 0.50 - 1.0).max(0.0),
@@ -1662,8 +1081,15 @@ pub fn extract_reference_sample(
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-y", "-hide_banner", "-v", "error"]);
         for s in starts {
-            cmd.args(["-noautorotate", "-ss", &format!("{:.2}", s), "-t", "2", "-i"])
-                .arg(input_path);
+            cmd.args([
+                "-noautorotate",
+                "-ss",
+                &format!("{:.2}", s),
+                "-t",
+                "2",
+                "-i",
+            ])
+            .arg(input_path);
         }
         let filt = format!(
             "[0:v]setpts=PTS-STARTPTS,format=yuv420p{p}[v0];\
@@ -1685,7 +1111,6 @@ pub fn extract_reference_sample(
     }
 
     if !extracted_ok {
-        // Single-segment extraction (short clips or sparse-keyframe ASF/WMV fallback).
         let sample_len = if dur > 0.0 { dur.clamp(1.0, 6.0) } else { 6.0 };
         let start = if dur > 10.0 {
             ((dur - sample_len) / 2.0).max(0.0)
@@ -1738,8 +1163,8 @@ pub fn extract_reference_sample(
     })
 }
 
-/// Detect NVIDIA consumer GPU NVENC concurrent session limit errors so the scheduler
-/// can dynamically cap concurrency and retry instead of marking videos failed.
+/// Detect NVIDIA consumer GPU NVENC concurrent session limit errors so the pool
+/// can dynamically cap concurrency and retry cleanly.
 pub fn is_nvenc_session_limit_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("openencodesessionex failed")
@@ -1759,14 +1184,12 @@ mod tests {
             nvenc_10bit: true,
             nvenc_bframes: true,
             nvenc_multipass: true,
-            nvenc_uhq: false,
             ..Default::default()
         };
-        let gpu = GpuEncoder { caps };
+        let gpu = Encoder::new(EncoderType::Gpu, &caps);
         let params = EncodeParams::for_quality(26, "slow", true, false);
-        let args = gpu.build_video_args(&params, true);
+        let args = gpu.build_gpu_video_args(&params, true);
 
-        // Must use -bf 4 (NOT broken `-b 4`!) and explicit `-b:v 0`
         assert!(args.windows(2).any(|w| w == ["-bf", "4"]));
         assert!(args.windows(2).any(|w| w == ["-b:v", "0"]));
         assert!(!args.windows(2).any(|w| w == ["-b", "4"]));
@@ -1784,7 +1207,7 @@ mod tests {
             nvenc_10bit: true,
             ..Default::default()
         };
-        let gpu = GpuEncoder { caps };
+        let gpu = Encoder::new(EncoderType::Gpu, &caps);
         let h264_info = VideoInfo {
             codec_name: Some("h264".into()),
             pix_fmt: Some("yuv420p".into()),
@@ -1795,14 +1218,15 @@ mod tests {
             pix_fmt: Some("yuv420p".into()),
             ..Default::default()
         };
-        assert!(gpu
-            .build_decode_args(&h264_info, Some(0))
-            .windows(2)
-            .any(|w| w == ["-hwaccel_output_format", "cuda"]));
-        assert!(gpu.build_decode_args(&wmv_info, Some(0)).is_empty());
+        assert!(
+            gpu.build_gpu_decode_args(&h264_info, Some(0))
+                .windows(2)
+                .any(|w| w == ["-hwaccel_output_format", "cuda"])
+        );
+        assert!(gpu.build_gpu_decode_args(&wmv_info, Some(0)).is_empty());
 
         let params = EncodeParams::for_quality(26, "medium", true, false);
-        let sw_args = gpu.build_video_args(&params, false);
+        let sw_args = gpu.build_gpu_video_args(&params, false);
         assert!(sw_args.windows(2).any(|w| w == ["-pix_fmt", "p010le"]));
     }
 
@@ -1813,9 +1237,9 @@ mod tests {
             x265_10bit: true,
             ..Default::default()
         };
-        let cpu = CpuEncoder { caps };
+        let cpu = Encoder::new(EncoderType::Cpu, &caps);
         let params = EncodeParams::for_quality(24, "medium", true, false);
-        let args = cpu.build_video_args(&params);
+        let (_, args) = cpu.build_standard_ffmpeg_args(&params);
         assert!(args.windows(2).any(|w| w == ["-pix_fmt", "yuv420p10le"]));
         assert!(!args.iter().any(|a| a.contains("fast=1")));
         assert!(args.iter().any(|a| a.contains("aq-mode=3")));
@@ -1829,7 +1253,7 @@ mod tests {
             jetson_gst_decoder: true,
             ..Default::default()
         };
-        let enc = JetsonGstEncoder { caps };
+        let enc = Encoder::new(EncoderType::JetsonGst, &caps);
         let small = VideoInfo {
             width: 120,
             height: 120,
@@ -1860,16 +1284,17 @@ mod tests {
             jetson_gst_audio_mux: true,
             ..Default::default()
         };
-        let enc = JetsonGstEncoder { caps };
+        let enc = Encoder::new(EncoderType::JetsonGst, &caps);
         let aac_info = VideoInfo {
             has_audio: true,
             audio_codec: Some("aac".into()),
             ..Default::default()
         };
-        let branch_copy = enc
-            .build_gst_audio_branch(&aac_info, AudioPlan::Copy)
-            .unwrap();
-        assert_eq!(branch_copy, vec!["aacparse", "!", "mp4mux"]);
+        assert_eq!(
+            enc.build_gst_audio_branch(&aac_info, AudioPlan::Copy)
+                .unwrap(),
+            vec!["aacparse", "!", "mp4mux"]
+        );
 
         let branch_trans = enc
             .build_gst_audio_branch(&aac_info, AudioPlan::TranscodeAac(128))
@@ -1878,13 +1303,31 @@ mod tests {
         assert!(branch_trans.contains(&"bitrate=128000".to_string()));
         assert!(branch_trans.contains(&"mp4mux".to_string()));
 
-        // Opus copy falls back cleanly to FFmpeg remux
         let opus_info = VideoInfo {
             has_audio: true,
             audio_codec: Some("opus".into()),
             ..Default::default()
         };
-        assert!(enc.build_gst_audio_branch(&opus_info, AudioPlan::Copy).is_none());
+        assert!(
+            enc.build_gst_audio_branch(&opus_info, AudioPlan::Copy)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hw_slot_pool_shrinks_safely_without_double_decrement() {
+        let pool = HwSlotPool::new(4);
+        let _p1 = pool.acquire();
+        let _p2 = pool.acquire();
+        // Simulate 2 other workers failing simultaneously in the wave at limit=4 (in_use now 2).
+        assert_eq!(pool.shrink_below(4), 2);
+        assert_eq!(pool.shrink_below(4), 2); // second worker in same wave must not over-shrink
+        assert_eq!(pool.limit(), 2);
+
+        // If a later wave at limit=2 fails while 1 slot is in use, shrinks cleanly to 1.
+        drop(_p2);
+        assert_eq!(pool.shrink_below(2), 1);
+        assert_eq!(pool.shrink_below(1), 1);
     }
 
     #[test]

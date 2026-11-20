@@ -17,12 +17,12 @@ use anyhow::Result;
 use clap::Parser;
 use config::{EncoderConfig, EncoderType};
 use crossbeam_channel::{Receiver, bounded, unbounded};
-use ffmpeg::{check_ffmpeg, detect_available_encoders, resolve_encoder_type};
-use gpu::DEFAULT_MAX_CONCURRENT;
+use ffmpeg::{check_ffmpeg, detect_hardware_capabilities, resolve_encoder_type};
+use gpu::{DEFAULT_JETSON_HW_CONCURRENT, DEFAULT_MAX_CONCURRENT};
 use logging::{LogLevel, log_always, log_error, log_info, set_log_level};
 use model::{ConversionStats, MediaItem, MediaStats, ProcessResult};
 use scanner::{scan_media_streaming, scan_webp_streaming};
-use scheduler::{VideoJobOptions, run_gpu_parallel, run_video_pool};
+use scheduler::{VideoJobOptions, run_gpu_parallel, run_hw_decoupled_pool, run_video_pool};
 use signal::{install_signal_handlers, is_shutdown_requested};
 use state::StateCache;
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use utils::{format_size, get_image_output_path, get_output_path};
 
-/// Video & image compression tool - recursively convert videos to H.265 and images to WebP
+/// Video & image compression tool - hardware-accelerated perceptual H.265 compression & WebP conversion
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -39,24 +39,28 @@ struct Args {
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Maximum CRF value (quality floor), when CRF=23 can't reach compression target,
-    /// this is the max CRF limit for extrapolation
-    #[arg(long, default_value = "35")]
+    /// Maximum quality knob (CRF/CQ/QP cap) during perceptual quality search
+    #[arg(long, default_value = "34")]
     max_crf: u8,
 
-    /// Minimum compression ratio (percentage), conversion only proceeds if this target is met
-    #[arg(long, default_value = "30")]
+    /// Minimum net size saving percentage required to replace original (output is ALWAYS strictly smaller than input)
+    #[arg(long, default_value = "15")]
     min_compression_ratio: u8,
+
+    /// Target perceptual XPSNR quality threshold in dB (higher = closer to visually lossless, recommended 41.0-43.5)
+    #[arg(long, default_value = "42.0")]
+    target_xpsnr: f64,
 
     /// Video encoder preset (e.g., fast, medium, slow, or NVENC p1-p7)
     #[arg(long, default_value = "medium")]
     preset: String,
 
-    /// Video encoder type (cpu, gpu, jetson, auto)
+    /// Video encoder type (auto, gpu, jetson, jetson-gst, nvmpi, qsv, vaapi, amf, videotoolbox, cpu)
     #[arg(long, default_value = "auto")]
     encoder: String,
 
-    /// Audio encoding bitrate (kbps), set to 0 to keep original audio
+    /// Audio encoding target bitrate (kbps); set to 0 to always copy original audio.
+    /// Compatible audio already at or below this bitrate is copied losslessly automatically.
     #[arg(short, long, default_value = "128")]
     audio_bitrate: u32,
 
@@ -64,11 +68,11 @@ struct Args {
     #[arg(long, default_value = "false")]
     dry_run: bool,
 
-    /// Max concurrent jobs (0 = auto: GPU up to 8, CPU/Jetson 1, images min(cpus, 8))
+    /// Max concurrent jobs (0 = auto: GPU dynamic up to 8, Jetson/HW 2, CPU 1, images min(cpus, 8))
     #[arg(short, long, default_value = "0")]
     jobs: usize,
 
-    /// Force serial processing (disable GPU parallel encoding & concurrent image pipeline)
+    /// Force serial processing (disable parallel encoding & concurrent image pipeline)
     #[arg(long, default_value = "false")]
     serial: bool,
 
@@ -91,17 +95,21 @@ const DEFAULT_MAX_IMAGE_WORKERS: usize = 8;
 /// Bounded queue capacity for backpressure between scanner and workers.
 const CHANNEL_CAPACITY: usize = 256;
 
-fn resolve_image_workers(jobs_arg: usize, serial: bool) -> usize {
+fn resolve_image_workers(jobs_arg: usize, serial: bool, concurrent_with_video: bool) -> usize {
     if serial {
         return 1;
     }
     if jobs_arg > 0 {
         return jobs_arg;
     }
-    std::thread::available_parallelism()
+    let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1)
-        .min(DEFAULT_MAX_IMAGE_WORKERS)
+        .unwrap_or(1);
+    if concurrent_with_video {
+        cpus.saturating_sub(2).clamp(1, DEFAULT_MAX_IMAGE_WORKERS)
+    } else {
+        cpus.min(DEFAULT_MAX_IMAGE_WORKERS)
+    }
 }
 
 fn resolve_gpu_max_jobs(jobs_arg: usize) -> usize {
@@ -112,12 +120,34 @@ fn resolve_gpu_max_jobs(jobs_arg: usize) -> usize {
     }
 }
 
+fn resolve_hw_jobs(jobs_arg: usize, serial: bool) -> usize {
+    if serial {
+        1
+    } else if jobs_arg > 0 {
+        jobs_arg
+    } else {
+        DEFAULT_JETSON_HW_CONCURRENT
+    }
+}
+
 fn resolve_cpu_video_jobs(jobs_arg: usize, serial: bool) -> usize {
     if serial || jobs_arg == 0 {
         1
     } else {
         jobs_arg
     }
+}
+
+fn build_cache_fingerprint(encoder_type: EncoderType, args: &Args) -> String {
+    format!(
+        "v2|enc={}|xpsnr={:.1}|min={}|maxq={}|preset={}|audio={}",
+        encoder_type.short_id(),
+        args.target_xpsnr,
+        args.min_compression_ratio,
+        args.max_crf,
+        args.preset,
+        args.audio_bitrate
+    )
 }
 
 fn repair_webp_files(input: &Path, dry_run: bool) -> Result<()> {
@@ -286,9 +316,20 @@ fn main() -> Result<()> {
         return repair_webp_files(&args.input, args.dry_run);
     }
 
+    // Real runtime hardware capability probe (once at startup).
+    let capabilities = detect_hardware_capabilities()?;
+    let encoder_type = resolve_encoder_type(&args.encoder, &capabilities)?;
+    let encoder_config = EncoderConfig {
+        encoder_type,
+        preset: args.preset.clone(),
+        capabilities,
+        target_xpsnr: args.target_xpsnr,
+    };
+
+    let cache_fingerprint = build_cache_fingerprint(encoder_type, &args);
     let state_cache = match &args.state_file {
         Some(path) => {
-            let cache = StateCache::open(path)?;
+            let cache = StateCache::open_with_fingerprint(path, cache_fingerprint)?;
             log_info(&format!(
                 "已加载状态缓存: {} ({} 条记录)",
                 path.display(),
@@ -299,34 +340,29 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    // Single-call encoder detection
-    let available_encoders = detect_available_encoders()?;
-    let encoder_type = resolve_encoder_type(&args.encoder, available_encoders)?;
-    let encoder_config = EncoderConfig {
-        encoder_type,
-        preset: args.preset.clone(),
-    };
-    let encoder_name = match encoder_config.encoder_type {
-        EncoderType::Cpu => "CPU (libx265)",
-        EncoderType::Gpu => "GPU (hevc_nvenc)",
-        EncoderType::Jetson => "Jetson GPU (hevc_nvmpi)",
-    };
+    log_info("视频/图片压缩工具 (硬件感知无损压缩模式)");
+    log_info(&format!("输入路径: {}", args.input.display()));
+    log_info("输出模式: 原子原地替换（视频->10-bit H.265 .mp4 / 图片->.webp，严格不大于原片）");
+    log_info(&format!("编码器: {}", encoder_type.display_name()));
+    log_info(&format!(
+        "感知目标: XPSNR >= {:.1} dB | 质量上限Q: {} | 最小净节省: {}%",
+        args.target_xpsnr, args.max_crf, args.min_compression_ratio
+    ));
+    log_info(&format!(
+        "编码预设: {} | 音频目标: {} (兼容低码率自动直拷)",
+        args.preset,
+        if args.audio_bitrate == 0 {
+            "强制直拷".to_string()
+        } else {
+            format!("{}kbps AAC", args.audio_bitrate)
+        }
+    ));
 
-    log_info("视频/图片压缩工具 (智能压缩模式)");
-    log_info(&format!("输入目录: {}", args.input.display()));
-    log_info("输出模式: 原子原地替换（视频->.mp4 / 图片->.webp）");
-    log_info(&format!("编码器: {}", encoder_name));
-    log_info(&format!("预览CRF: 23 | 最大CRF: {}", args.max_crf));
-    log_info(&format!("最小压缩比: {}%", args.min_compression_ratio));
-    log_info(&format!("编码预设: {}", args.preset));
-    log_info(&format!("音频比特率: {}kbps", args.audio_bitrate));
-
-    check_ffmpeg(encoder_config.encoder_type, available_encoders)?;
+    check_ffmpeg(encoder_config.encoder_type, &encoder_config.capabilities)?;
 
     let mut results = ConversionStats::default();
 
     if args.dry_run {
-        // Single-pass scan for dry-run
         log_info("单次遍历扫描媒体文件中...\n");
         let mut video_count = 0usize;
         let mut image_count = 0usize;
@@ -359,12 +395,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let image_workers = resolve_image_workers(args.jobs, args.serial);
+    let concurrent_images = encoder_type.allows_concurrent_images() && !args.serial;
+    let image_workers = resolve_image_workers(args.jobs, args.serial, concurrent_images);
 
-    if matches!(encoder_config.encoder_type, EncoderType::Gpu) && !args.serial {
-        // GPU parallel mode: single-pass scanner feeds both GPU video scheduler
-        // and CPU image worker pool concurrently (heterogeneous hardware utilization).
-        log_info("开始单次流式扫描，视频(GPU)与图片(CPU)并行处理...\n");
+    if concurrent_images {
+        log_info("开始单次流式扫描，视频(专用硬件)与图片(CPU)异构并行处理...\n");
         let (video_tx, video_rx) = bounded::<PathBuf>(CHANNEL_CAPACITY);
         let (image_tx, image_rx) = bounded::<PathBuf>(CHANNEL_CAPACITY);
         let video_discovered = Arc::new(AtomicUsize::new(0));
@@ -392,30 +427,53 @@ fn main() -> Result<()> {
         let image_handle =
             thread::spawn(move || run_image_pool(image_rx, image_workers, img_cache));
 
-        let video_options = VideoJobOptions {
-            encoder_config,
-            max_crf: args.max_crf,
-            min_compression_ratio: args.min_compression_ratio,
-            audio_bitrate: args.audio_bitrate,
-            max_concurrency: resolve_gpu_max_jobs(args.jobs),
-            state_cache,
-        };
-        run_gpu_parallel(
-            video_rx,
-            video_discovered,
-            &video_options,
-            &mut results.video,
-        )?;
+        if encoder_type == EncoderType::Gpu {
+            let video_options = VideoJobOptions {
+                encoder_config,
+                max_crf: args.max_crf,
+                min_compression_ratio: args.min_compression_ratio,
+                audio_bitrate: args.audio_bitrate,
+                max_concurrency: resolve_gpu_max_jobs(args.jobs),
+                state_cache,
+            };
+            run_gpu_parallel(
+                video_rx,
+                video_discovered,
+                &video_options,
+                &mut results.video,
+            )?;
+        } else {
+            let video_options = VideoJobOptions {
+                encoder_config,
+                max_crf: args.max_crf,
+                min_compression_ratio: args.min_compression_ratio,
+                audio_bitrate: args.audio_bitrate,
+                max_concurrency: if encoder_type == EncoderType::JetsonNvmpi {
+                    1
+                } else {
+                    resolve_hw_jobs(args.jobs, args.serial)
+                },
+                state_cache,
+            };
+            run_hw_decoupled_pool(
+                video_rx,
+                video_discovered,
+                &video_options,
+                args.serial,
+                &mut results.video,
+            )?;
+        }
 
         let _ = scan_handle.join();
         if let Ok(image_stats) = image_handle.join() {
             results.image = image_stats;
         }
     } else {
-        // CPU / Jetson / serial mode: single-pass scanner streams videos immediately
-        // and collects image paths (avoiding a second WalkDir traversal and avoiding
-        // CPU contention between libx265 and libwebp).
-        let video_jobs = resolve_cpu_video_jobs(args.jobs, args.serial);
+        let video_jobs = if encoder_type.is_hardware() {
+            1
+        } else {
+            resolve_cpu_video_jobs(args.jobs, args.serial)
+        };
         log_info(&format!(
             "开始单次流式扫描和处理 (视频并发: {}, 图片并发: {})...\n",
             video_jobs, image_workers
@@ -483,7 +541,6 @@ fn main() -> Result<()> {
         log_always("\n收到中断信号，已优雅停止。");
     }
 
-    // Output separated and combined statistics
     let combined = results.combined();
     log_always(&format!("\n{}", "=".repeat(50)));
     log_always("转换完成!");

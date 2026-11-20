@@ -1,210 +1,83 @@
 # Video Compressor
 
-用Rust编写的高效视频压缩工具，将目录中的所有视频递归转换为H.265格式以减小体积。
+用 Rust 编写的硬件优先、感知无损视频/图片压缩工具：尽可能调用本机最快的硬件编码器，在保证人眼不易察觉画质损失的前提下最大化减小体积，并严格保证**转换后文件绝不大于原文件**。
 
-## 功能特性
+## 核心特性
 
-- **智能压缩算法**：
-  - 预览编码：先编码10%视频（5-30秒）预估压缩比
-  - 动态CRF：CRF=23优先，不足时自动外推更高CRF
-  - H.264源必须达到30%压缩比才执行转换
-  - 质量上限：CRF最大35，超过则跳过
-- **GPU硬件加速**：
-  - NVIDIA NVENC (hevc_nvenc)
-  - Jetson Orin NVMPI (hevc_nvmpi)
-  - 自动检测可用编码器
-- **GPU并行处理**：支持多视频并行编码
-- **流式扫描**：边扫描边处理，无需等待扫描完成
-- 自动跳过已是H.265编码的视频
-- 原地替换（保留原文件名，扩展名改为.mp4）
-- 详细统计信息输出
+- **硬件优先 & 零自编译 FFmpeg**：
+  - **Jetson Orin / JetPack**：默认采用官方原生 **GStreamer `nvv4l2h265enc` (10-bit Main10) + `nvv4l2decoder` NVMM 零拷贝**，再由系统标准 `ffmpeg` 毫秒级 `-c:v copy` 合流封装（彻底告别自编译 `jetson-ffmpeg`；冷门格式自动走标准 `ffmpeg` 软解管道喂给硬件编码器；仍保留 `--encoder nvmpi` 兼容选项）
+  - **桌面 NVIDIA GPU**：`hevc_nvenc`（10-bit Main10 + 条件 `-hwaccel_output_format cuda` 零拷贝 + `-bf 4 -b:v 0` + `-multipass qres` + 多 GPU 轮询 + 会话数上限自动降并发重试）
+  - **跨平台硬件**：自动运行时探测并支持 **Intel QSV (`hevc_qsv`)**、**Linux VA-API (`hevc_vaapi`)**、**AMD AMF (`hevc_amf`)**、**Apple VideoToolbox (`hevc_videotoolbox`)**
+  - **CPU 兜底**：`libx265` 10-bit + 心理视觉优化 (`aq-mode=3:limit-sao=1:deblock=-1,-1`)
+- **感知无损搜索 + 四层“绝不大于原片”硬防线**：
+  1. **零编码预筛**：自动跳过已是 HEVC / AV1 / VP9 的视频与超低 BPP 紧压 H.264；智能音频策略（低码率兼容音频直拷 `-c:a copy`，多声道自动保护码率）；HDR 10-bit 防降级
+  2. **硬件加速感知质量搜索**：单命令提取 6s 纯视频样本，基于 FFmpeg 内置 `XPSNR`（1/3 抽帧提速，无 `xpsnr` 时自动退回 `SSIM`）执行 3 步噪点拐点感知搜索，在满足视觉透明前提下选中最小体积参数，若预估未达净节省阈值直接跳过
+  3. **编码期实时体积熔断**：全量编码期间实时监控输出文件大小，一旦触及原片体积立即终止并保留原文件
+  4. **落盘前硬门禁**：严格校验 `output_size < input_size`、净节省达标、视频流完整且时长一致后才原子替换（带 `-tag:v hvc1` 苹果兼容标签与 `-movflags +faststart`）
+- **异构并行流水线**：
+  - 硬件模式下（含 Jetson 与桌面 GPU）采用硬件编码槽解耦调度，视频硬件编码与 CPU 图片 WebP 转换并发执行
+  - 单次流式扫描、SIGINT/SIGTERM 优雅退出、带配置指纹的增量跳过缓存（`--state-file`）
 
 ## 依赖
 
 - Rust (2024 edition)
-- FFmpeg (需要libx265支持，GPU编码需hevc_nvenc或hevc_nvmpi支持)
-
-### 安装依赖
-
-#### Arch Linux
-```bash
-sudo pacman -S ffmpeg
-```
-
-#### Ubuntu/Debian
-```bash
-sudo apt install ffmpeg
-```
-
-#### Fedora
-```bash
-sudo dnf install ffmpeg
-```
+- 标准系统 **FFmpeg / ffprobe**（无需任何第三方补丁重编译）
+- **Jetson 平台**：JetPack 官方预装的 `gstreamer1.0` + NVIDIA L4T `nvv4l2` 插件
 
 ## 构建
 
-### 标准构建
 ```bash
 cargo build --release
+# 或静态构建
+make musl
 ```
-
-### 静态链接构建 (需要musl-tools)
-```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-或使用Makefile:
-```bash
-make musl    # 静态构建
-make build   # 标准构建
-```
-
-静态链接的二进制文件位于: `target/x86_64-unknown-linux-musl/release/video_compressor`
 
 ## 使用
 
 ```bash
-# 基本使用（自动检测编码器）
+# 自动运行时探测最快可用硬件（Jetson 自动使用官方 GStreamer 10-bit nvv4l2h265enc）
 ./video_compressor -i /path/to/videos
 
-# 指定编码器
-./video_compressor -i /path/to/videos --encoder cpu    # 强制CPU编码
-./video_compressor -i /path/to/videos --encoder gpu    # NVIDIA GPU编码
-./video_compressor -i /path/to/videos --encoder jetson # Jetson编码
+# 调整感知质量目标（XPSNR 越高越接近无损，推荐 41.0-43.5 dB）
+./video_compressor -i /path/to/videos --target-xpsnr 42.5
 
-# 调整压缩要求（H264源必须达到50%压缩）
-./video_compressor -i /path/to/videos --min-compression-ratio 50
+# 调整最小净节省门槛（默认 15%；无论设多少均严格保证输出小于原文件）
+./video_compressor -i /path/to/videos --min-compression-ratio 20
 
-# 调整质量上限
-./video_compressor -i /path/to/videos --max-crf 30
+# 显式指定后端
+./video_compressor -i /path/to/videos --encoder jetson-gst    # Jetson 官方硬件
+./video_compressor -i /path/to/videos --encoder gpu           # 桌面 NVIDIA NVENC
+./video_compressor -i /path/to/videos --encoder qsv           # Intel QSV
+./video_compressor -i /path/to/videos --encoder vaapi         # AMD/Intel VA-API
+./video_compressor -i /path/to/videos --encoder cpu           # CPU libx265 10-bit
 
-# 设置编码预设
-./video_compressor -i /path/to/videos --preset fast
+# 控制并发与增量缓存
+./video_compressor -i /path/to/videos --jobs 2 --state-file ~/.cache/vc.state
 
-# 调整音频比特率（设为0保留原音频）
-./video_compressor -i /path/to/videos --audio-bitrate 192
-./video_compressor -i /path/to/videos -a 0
-
-# GPU并行处理（设置并发任务数）
-./video_compressor -i /path/to/videos --jobs 4
-
-# 强制串行处理（禁用GPU并行）
-./video_compressor -i /path/to/videos --serial
-
-# 仅扫描不转换
+# 仅扫描不执行
 ./video_compressor -i /path/to/videos --dry-run
 
-# 一次性检测旧版本生成的 EXIF-first 错误 WebP
-./video_compressor -i /path/to/pictures --repair-webp --dry-run
-
-# 原位修复错误 WebP；保留 EXIF、inode、权限、所有者、atime 和 mtime
+# WebP 容器修复模式
 ./video_compressor -i /path/to/pictures --repair-webp
 ```
 
-## 智能压缩算法
-
-### 工作流程
-
-1. **流式扫描**：递归查找目录中的视频文件，边扫描边处理
-2. **检测编码**：使用ffprobe检测源视频编码
-3. **跳过HEVC**：已是H.265编码的视频直接跳过
-4. **预览编码**：编码10%时长视频（限制5-30秒），使用CRF=23
-5. **预测压缩比**：根据预览结果推算完整视频压缩比
-6. **动态调整CRF**：
-   - 如果预测压缩比 >= 30%: 使用CRF=23（最佳质量）
-   - 如果预测压缩比 < 30%: 指数外推更高CRF
-   - 如果外推CRF > max-crf: 跳过该视频
-7. **执行转换**：使用确定的CRF进行完整编码
-
-### 为什么这样设计
-
-- **CRF=23预览**：保证画质不低于"高质量"水平
-- **30%压缩比**：H.265比H.264效率高约50%，30%是合理下限
-- **指数外推**：CRF每增加6，码率约减半，用于推算达到目标压缩比所需CRF
-- **原地替换**：简化输出管理，保持目录结构
-
-### 参数说明
+## 参数说明
 
 | 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `-i, --input` | 输入目录 | 必需 |
-| `--encoder` | 编码器类型 (cpu/gpu/jetson/auto) | auto |
-| `--max-crf` | 最大CRF（质量下限） | 35 |
-| `--min-compression-ratio` | H264源最小压缩比(%) | 30 |
-| `--preset` | 编码预设 | medium |
-| `-a, --audio-bitrate` | 音频比特率(kbps)，0保留原音频 | 128 |
-| `-j, --jobs` | 最大并发任务数 (0=自动：GPU动态至8，CPU/Jetson为1，图片≤8) | 0 |
-| `--serial` | 强制串行处理 | false |
-| `--dry-run` | 仅扫描不执行 | false |
-| `--repair-webp` | 修复旧版本生成的 EXIF-first WebP 后退出 | false |
-| `--log-level` | 日志级别 (quiet/info/debug) | info |
-| `--state-file` | 持久化跳过缓存文件，避免重跑重复探测/预览 | 无 |
-
-### CRF 参考值
-
-- 18-23: 高质量到视觉无损
-- 23-28: 中等质量（推荐范围）
-- 28-35: 较低质量
-- 35+: 低质量
-
-### 编码预设
-
-从快到慢: `ultrafast` -> `superfast` -> `veryfast` -> `faster` -> `fast` -> `medium` -> `slow` -> `slower` -> `veryslow`
-
-较慢的预设会产生更小的文件，但需要更长的处理时间。
-
-## GPU编码支持
-
-### NVIDIA NVENC
-
-需要NVIDIA GPU和驱动支持，FFmpeg需编译时包含`--enable-nvenc`。
-
-检测支持：
-```bash
-ffmpeg -encoders | grep nvenc
-```
-
-### Jetson Orin NVMPI
-
-适用于NVIDIA Jetson设备，使用硬件视频编码引擎。
-
-检测支持：
-```bash
-ffmpeg -encoders | grep nvmpi
-```
-
-## 支持的视频格式
-
-- MP4, MKV, AVI, MOV, FLV, WMV, WebM, M4V, MPG, MPEG, 3GP
-
-## 项目结构
-
-```
-.
-├── src/
-│   ├── main.rs       # 程序入口，CLI参数解析与单次遍历管线编排
-│   ├── config.rs     # 编码器类型与参数定义
-│   ├── model.rs      # 公共媒体模型与分类统计
-│   ├── encoder.rs    # VideoEncoder策略抽象、预览/全量编码逻辑
-│   ├── ffmpeg.rs     # FFmpeg/ffprobe调用与单次编码器能力探测
-│   ├── gpu.rs        # GPU编码器利用率监控与动态并发控制器
-│   ├── scheduler.rs  # 固定线程池 + 事件驱动并发调度器
-│   ├── scanner.rs    # 单次流式媒体文件扫描
-│   ├── video.rs      # 视频智能压缩决策与原子替换
-│   ├── image.rs      # 图片转WebP与EXIF保留
-│   ├── webp_mux.rs   # libwebp合规VP8X/EXIF封装与原位修复
-│   ├── state.rs      # 可选增量跳过缓存
-│   ├── signal.rs     # SIGINT/SIGTERM优雅退出与子进程清理
-│   ├── logging.rs    # 线程安全分级日志
-│   └── utils.rs      # 原子替换、大小格式化与路径工具
-├── Cargo.toml        # 项目配置
-├── .cargo/
-│   └── config.toml   # 静态链接配置
-├── Makefile          # 构建脚本
-├── CLAUDE.md         # 项目说明（Claude Code）
-└── README.md         # 本文件
-```
+| :--- | :--- | :--- |
+| `-i, --input` | 输入目录或单个文件 | 必需 |
+| `--encoder` | 编码器 (`auto`/`gpu`/`jetson`/`jetson-gst`/`nvmpi`/`qsv`/`vaapi`/`amf`/`videotoolbox`/`cpu`) | `auto` |
+| `--target-xpsnr` | 目标感知质量阈值 (dB，推荐 41.0~43.5) | `42.0` |
+| `--max-crf` | 感知搜索允许的最高质量步进上限 (CRF/CQ/QP) | `34` |
+| `--min-compression-ratio` | 最小净节省比例 (%)；同时硬保证输出严格小于原片 | `15` |
+| `--preset` | 编码预设 (`fast`/`medium`/`slow`/`p1`..`p7`) | `medium` |
+| `-a, --audio-bitrate` | 音频目标码率 (kbps)，`0` 强制直拷；兼容且码率未超标时自动直拷 | `128` |
+| `-j, --jobs` | 最大硬件并发数 (`0`=自动：桌面GPU动态至8，Jetson/HW为2，CPU为1) | `0` |
+| `--serial` | 强制串行处理 | `false` |
+| `--dry-run` | 仅扫描不执行 | `false` |
+| `--repair-webp` | 修复旧版 EXIF-first WebP 后退出 | `false` |
+| `--log-level` | 日志级别 (`quiet`/`info`/`debug`) | `info` |
+| `--state-file` | 带配置指纹的增量跳过缓存文件 | 无 |
 
 ## 许可
 

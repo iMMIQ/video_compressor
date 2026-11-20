@@ -98,7 +98,7 @@ pub fn process_image(input_path: &Path, state_cache: Option<&StateCache>) -> Res
 
     let record_skip = |reason: String| -> Result<ProcessResult> {
         if let Some(cache) = state_cache {
-            cache.record_skip(input_path, input_size, mtime_secs, &reason);
+            cache.record_permanent_skip(input_path, input_size, mtime_secs, &reason);
         }
         Ok(ProcessResult::Skipped(reason))
     };

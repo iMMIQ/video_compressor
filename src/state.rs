@@ -9,20 +9,23 @@ use std::sync::Mutex;
 struct CachedSkip {
     size: u64,
     mtime_secs: i64,
+    fingerprint: String,
     reason: String,
 }
 
 /// Optional persistent cache of skipped files so repeated runs on large
-/// directories avoid redundant ffprobe / preview-encode work on files that
-/// have not changed.
+/// directories avoid redundant ffprobe / perceptual search work on unchanged files.
+/// Entries are scoped by `config_fingerprint` so changing encoder, target XPSNR,
+/// or minimum saving ratio automatically invalidates stale video skip decisions.
 pub struct StateCache {
     entries: Mutex<HashMap<PathBuf, CachedSkip>>,
     writer: Mutex<Option<BufWriter<File>>>,
+    fingerprint: String,
 }
 
 impl StateCache {
-    /// Open or create a state file at `path`. Existing valid lines are loaded.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Open or create a state file at `path`, scoped to `fingerprint`.
+    pub fn open_with_fingerprint(path: &Path, fingerprint: impl Into<String>) -> Result<Self> {
         let mut map = HashMap::new();
 
         if path.exists() {
@@ -39,9 +42,8 @@ impl StateCache {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("无法创建状态缓存目录: {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("无法创建状态缓存目录: {}", parent.display()))?;
         }
 
         let file = OpenOptions::new()
@@ -53,6 +55,7 @@ impl StateCache {
         Ok(Self {
             entries: Mutex::new(map),
             writer: Mutex::new(Some(BufWriter::new(file))),
+            fingerprint: fingerprint.into(),
         })
     }
 
@@ -61,20 +64,42 @@ impl StateCache {
         self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Check if `path` with `(size, mtime_secs)` was previously skipped.
+    /// Check if `path` with `(size, mtime_secs)` was previously skipped under the current
+    /// config fingerprint (or for fingerprint-independent reasons like images / already-HEVC).
     pub fn get_cached_skip(&self, path: &Path, size: u64, mtime_secs: i64) -> Option<String> {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries
             .get(path)
-            .filter(|e| e.size == size && e.mtime_secs == mtime_secs)
+            .filter(|e| {
+                e.size == size
+                    && e.mtime_secs == mtime_secs
+                    && (e.fingerprint == "*" || e.fingerprint == self.fingerprint)
+            })
             .map(|e| e.reason.clone())
     }
 
-    /// Record a skipped file into memory and append it to the state file.
+    /// Record a skipped file scoped to the current config fingerprint.
     pub fn record_skip(&self, path: &Path, size: u64, mtime_secs: i64, reason: &str) {
+        self.record_skip_with_scope(path, size, mtime_secs, &self.fingerprint, reason);
+    }
+
+    /// Record a skipped file valid across all video config fingerprints (e.g. already HEVC/AV1 or images).
+    pub fn record_permanent_skip(&self, path: &Path, size: u64, mtime_secs: i64, reason: &str) {
+        self.record_skip_with_scope(path, size, mtime_secs, "*", reason);
+    }
+
+    fn record_skip_with_scope(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime_secs: i64,
+        scope: &str,
+        reason: &str,
+    ) {
         let entry = CachedSkip {
             size,
             mtime_secs,
+            fingerprint: scope.to_string(),
             reason: reason.to_string(),
         };
 
@@ -85,7 +110,7 @@ impl StateCache {
 
         let mut writer_guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(writer) = writer_guard.as_mut() {
-            let line = format_line(path, size, mtime_secs, reason);
+            let line = format_line(path, size, mtime_secs, scope, reason);
             if writeln!(writer, "{}", line).is_ok() {
                 let _ = writer.flush();
             }
@@ -130,28 +155,35 @@ fn unescape_field(s: &str) -> String {
     out
 }
 
-fn format_line(path: &Path, size: u64, mtime_secs: i64, reason: &str) -> String {
+fn format_line(path: &Path, size: u64, mtime_secs: i64, fingerprint: &str, reason: &str) -> String {
     format!(
-        "{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}",
         escape_field(&path.to_string_lossy()),
         size,
         mtime_secs,
+        escape_field(fingerprint),
         escape_field(reason)
     )
 }
 
 fn parse_line(line: &str) -> Option<(PathBuf, CachedSkip)> {
-    let mut parts = line.splitn(4, '\t');
+    let mut parts = line.splitn(5, '\t');
     let path_str = parts.next()?;
     let size: u64 = parts.next()?.parse().ok()?;
     let mtime_secs: i64 = parts.next()?.parse().ok()?;
-    let reason_str = parts.next()?;
+    let fourth = parts.next()?;
+    let (fingerprint, reason_str) = match parts.next() {
+        Some(fifth) => (unescape_field(fourth), fifth),
+        // Legacy 4-column state file: treat as unmatched fingerprint unless wildcard
+        None => (String::new(), fourth),
+    };
 
     Some((
         PathBuf::from(unescape_field(path_str)),
         CachedSkip {
             size,
             mtime_secs,
+            fingerprint,
             reason: unescape_field(reason_str),
         },
     ))
@@ -162,30 +194,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_cache_roundtrip_and_invalidation() {
+    fn state_cache_roundtrip_and_fingerprint_invalidation() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.tsv");
         let media_path = PathBuf::from("/mnt/nas/videos/foo\tbar\\baz.mp4");
+        let hevc_path = PathBuf::from("/mnt/nas/videos/already.mp4");
 
         {
-            let cache = StateCache::open(&state_path).unwrap();
+            let cache = StateCache::open_with_fingerprint(&state_path, "jetson-gst|x=42|m=15").unwrap();
             assert_eq!(cache.len(), 0);
-            cache.record_skip(&media_path, 12345, 1_700_000_000, "需要CRF=38 超出限制(35)");
+            cache.record_skip(&media_path, 12345, 1_700_000_000, "预估节省不足");
+            cache.record_permanent_skip(&hevc_path, 999, 1_700_000_000, "已是H.265编码");
             assert_eq!(
                 cache.get_cached_skip(&media_path, 12345, 1_700_000_000).as_deref(),
-                Some("需要CRF=38 超出限制(35)")
+                Some("预估节省不足")
             );
-            // Size or mtime change invalidates the entry
+            // Size or mtime change invalidates
             assert!(cache.get_cached_skip(&media_path, 99999, 1_700_000_000).is_none());
             assert!(cache.get_cached_skip(&media_path, 12345, 1_700_000_001).is_none());
         }
 
-        // Reload from disk
-        let reloaded = StateCache::open(&state_path).unwrap();
-        assert_eq!(reloaded.len(), 1);
+        // Same fingerprint hits
+        let reloaded_same =
+            StateCache::open_with_fingerprint(&state_path, "jetson-gst|x=42|m=15").unwrap();
+        assert_eq!(reloaded_same.len(), 2);
         assert_eq!(
-            reloaded.get_cached_skip(&media_path, 12345, 1_700_000_000).as_deref(),
-            Some("需要CRF=38 超出限制(35)")
+            reloaded_same
+                .get_cached_skip(&media_path, 12345, 1_700_000_000)
+                .as_deref(),
+            Some("预估节省不足")
+        );
+
+        // Changed fingerprint invalidates video skip, but keeps permanent already-HEVC skip
+        let reloaded_new =
+            StateCache::open_with_fingerprint(&state_path, "jetson-gst|x=40|m=10").unwrap();
+        assert!(
+            reloaded_new
+                .get_cached_skip(&media_path, 12345, 1_700_000_000)
+                .is_none()
+        );
+        assert_eq!(
+            reloaded_new
+                .get_cached_skip(&hevc_path, 999, 1_700_000_000)
+                .as_deref(),
+            Some("已是H.265编码")
         );
     }
 }

@@ -4,147 +4,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Video Compressor - A Rust tool that recursively converts videos to H.265/HEVC format with intelligent compression logic:
-- Fixed CRF=23 preview encoding (10% of video duration, 5-30 seconds)
-- If predicted compression >= 30%: use CRF=23 for full encode (best quality)
-- If predicted compression < 30%: extrapolate higher CRF using exponential formula
-- Maximum CRF limit of 35 (skip video if extrapolated CRF > 35)
-- H.264 sources must achieve 30% compression or conversion is skipped
+Video Compressor — A Rust CLI tool for hardware-first, perceptually transparent H.265/HEVC video compression and WebP image conversion with a strict zero-bloat guarantee (`output_size < input_size` always):
 
-## Encoder Support
+- **Runtime hardware probing** (`detect_hardware_capabilities`): probes real encoders at startup (never relies solely on `ffmpeg -encoders` text).
+- **Jetson official hardware stack (zero custom FFmpeg)**: uses JetPack's preinstalled GStreamer `nvv4l2decoder ! nvvidconv ! nvv4l2h265enc` (10-bit Main10 `P010_10LE`, `maxperf-enable=1`, `iframeinterval=240`, `qp-range`) + standard system `ffmpeg` millisecond `-c:v copy` remux (`-tag:v hvc1 -movflags +faststart`). Non-NVDEC formats (e.g. WMV2) fall back seamlessly via direct Rust `ffmpeg | gst-launch-1.0` pipe.
+- **Desktop NVENC (`hevc_nvenc`)**: conditional zero-copy `-hwaccel cuda -hwaccel_output_format cuda`, 10-bit `main10`, `-bf 4 -b_ref_mode middle`, `-b:v 0` pure CQ-VBR, `-multipass qres`, multi-GPU round-robin, and automatic session-limit backoff & retry.
+- **Cross-platform hardware**: Intel QSV (`hevc_qsv`), Linux VA-API (`hevc_vaapi`), AMD AMF (`hevc_amf`), Apple VideoToolbox (`hevc_videotoolbox`), legacy `hevc_nvmpi`, and 10-bit `libx265` CPU fallback.
+- **Perceptual quality search + 4-layer zero-bloat pipeline**:
+  1. Single-call `ffprobe` pre-filter (skip HEVC/AV1/VP9, ultra-low BPP H.264, smart `AudioPlan` copy vs channel-aware AAC, HDR 10-bit protection).
+  2. Single-command 6s pure-video (`-an`) reference sample + 3-step noise-knee-aware `XPSNR` (1/3 subsampled, fallback `SSIM`) search + pure video/audio separated budget pruning.
+  3. Full encode with real-time `SizeWatchdog` early abort if temp output reaches original file size.
+  4. Final gate verifying strict `output_size < input_size`, net saving >= `min_compression_ratio`, and `ffprobe` stream + duration consistency before atomic same-directory replacement.
 
-Three encoder types are supported:
-- **CPU (libx265)**: Software encoding, universal compatibility
-- **GPU (hevc_nvenc)**: NVIDIA hardware encoding via NVENC
-- **Jetson (hevc_nvmpi)**: NVIDIA Jetson Orin hardware encoding via NVMPI
+## Build & Test Commands
 
-Use `--encoder auto` to automatically detect the best available encoder.
-
-## Build Commands
-
-### Standard build (dynamic linking):
-```bash
-cargo build --release
-```
-
-### Static build (musl target, requires musl-tools):
-```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-```
-
-Or use Makefile:
-```bash
-make musl    # Static build
-make build   # Standard build
-```
-
-Static binary location: `target/x86_64-unknown-linux-musl/release/video_compressor`
-
-### Run tests:
 ```bash
 cargo test
-```
-
-### Run directly (with args):
-```bash
-cargo run -- --input /path/to/videos --max-crf 35 --min-compression-ratio 30
-```
-
-### Run with GPU encoding:
-```bash
-cargo run -- --input /path/to/videos --encoder gpu
-```
-
-### Run with auto-detection (default):
-```bash
-cargo run -- --input /path/to/videos --encoder auto
-```
-
-### Run with CPU encoding:
-```bash
-cargo run -- --input /path/to/videos --encoder cpu
+cargo build --release
+make musl
 ```
 
 ## Architecture
 
-The application is a modular CLI tool with the following structure:
-
 ```
 src/
-├── main.rs       # Entry point, CLI parsing, single-pass pipeline orchestration
-├── config.rs     # EncoderType, EncoderConfig, EncodeParams definitions
+├── main.rs       # Entry point, CLI parsing, runtime capability probe, heterogeneous pipeline
+├── config.rs     # EncoderType, HardwareCapabilities, EncoderConfig, QualityProfile, EncodeParams
 ├── model.rs      # Shared MediaItem, ProcessResult, FileStats, ConversionStats
-├── encoder.rs    # VideoEncoder strategy trait (CPU/GPU/Jetson), preview/full encode
-├── ffmpeg.rs     # FFmpeg/ffprobe key=value parsing & single-call encoder detection
-├── gpu.rs        # NVENC encoder utilization monitor & bounded ConcurrencyController
-├── scheduler.rs  # Fixed worker pool + event-driven dynamic GPU/CPU schedulers
-├── scanner.rs    # Single-pass streaming media & WebP scanner (NFS-friendly file_type)
-├── video.rs      # Video compression decision logic (decide_crf) & safe replacement
+├── encoder.rs    # VideoEncoder strategy backends, HwSlotPool semaphore, single-cmd sample extractor
+├── ffmpeg.rs     # Single-call ffprobe parser, AudioPlan, runtime HW probe, fast XPSNR/SSIM metrics
+├── gpu.rs        # Multi-GPU NVENC monitor & anti-oscillation ConcurrencyController
+├── scheduler.rs  # Dynamic NVENC pool (with session-limit retry) & HW-slot decoupled pool
+├── scanner.rs    # Single-pass streaming media & WebP scanner
+├── video.rs      # 4-layer zero-bloat perceptual compression pipeline
 ├── image.rs      # Image-to-WebP conversion with EXIF preservation
 ├── webp_mux.rs   # libwebp VP8X/EXIF muxing and in-place repair
-├── state.rs      # Optional persistent skip-cache (--state-file)
-├── signal.rs     # SIGINT/SIGTERM graceful shutdown & cancellable subprocess runner
-├── logging.rs    # Thread-safe leveled logging (--log-level)
+├── state.rs      # Config-fingerprinted persistent skip-cache (--state-file)
+├── signal.rs     # SIGINT/SIGTERM shutdown, SizeWatchdog, shell-free OS pipeline runner
+├── logging.rs    # Thread-safe leveled logging
 └── utils.rs      # Crash-safe atomic_replace_from_temp, size formatting, path helpers
 ```
-
-### Processing Pipeline
-
-1. **CLI parsing** (`Args` struct) - clap derive API for argument parsing
-2. **Encoder detection** (`resolve_encoder_type`) - Resolves encoder type (auto/cpu/gpu/jetson)
-3. **FFmpeg detection** (`check_ffmpeg`) - Verifies FFmpeg and encoder support
-4. **Streaming scan** (`scan_videos_streaming`) - walkdir for recursive file discovery with callback
-5. **Video info** (`get_video_info`) - ffprobe for codec, resolution, duration
-6. **Preview encoding** (`preview_encode`) - Encodes 10% duration at CRF=23
-7. **CRF extrapolation** - Uses exponential formula if compression insufficient
-8. **Full encoding** (`full_encode`) - Complete conversion with selected CRF
-
-### GPU Parallel Processing
-
-When using GPU encoding (`--encoder gpu` or `--encoder jetson`), the scheduler enables parallel processing:
-- Multiple videos encoded simultaneously (controlled by `--jobs`)
-- Dynamic concurrency based on encoder queue capacity
-- Use `--serial` to disable parallel processing
-
-### Key Algorithm (process_video)
-
-```
-for each video:
-    select encoder (CPU/GPU based on --encoder flag)
-    detect source codec
-    if HEVC: skip (already compressed)
-
-    preview_duration = 10% of video (capped at 5-30 seconds)
-    preview_result = preview_encode(CRF=23, preview_duration)
-
-    # Apply correction factor (preview encode is ~1.8x smaller than full)
-    predicted_ratio = 1 - (preview_output_per_sec * duration * 1.8) / input_size
-
-    if predicted_ratio >= 30%:
-        final_crf = 23  # Best quality that meets target
-    else:
-        # Exponential extrapolation: CRF +6 ≈ bitrate halved
-        extrapolated_crf = 23 - 6 * log2(target_output_ratio / predicted_output_ratio)
-
-        if extrapolated_crf > 35:
-            skip video  # Would require too much quality loss
-        else:
-            final_crf = extrapolated_crf
-
-    full_encode(final_crf)
-```
-
-## Static Linking Configuration
-
-Located in `.cargo/config.toml`:
-- Uses `x86_64-unknown-linux-musl` target
-- `link-self-contained=yes` and `-static` flag
-
-## Dependencies
-
-- `clap` - CLI argument parsing with derive macros
-- `anyhow` - Error handling
-- `walkdir` - Recursive directory traversal
-- `tempfile` - Temporary files for preview encoding
-- `crossbeam-channel` - Thread communication for streaming processing

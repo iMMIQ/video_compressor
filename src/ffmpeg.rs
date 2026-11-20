@@ -156,6 +156,7 @@ impl VideoInfo {
         let codec = self.codec_name.as_deref()?.to_ascii_lowercase();
         let parser = match codec.as_str() {
             "h264" => "h264parse",
+            "hevc" | "h265" => "h265parse",
             "mpeg4" => "mpeg4videoparse",
             "mpeg2video" => "mpegvideoparse",
             _ => return None,
@@ -1289,6 +1290,17 @@ bit_rate=25500000
         assert_eq!(info.audio_bitrate, 384_000);
         assert!((info.duration - 120.5).abs() < 1e-6);
         assert_eq!(info.gst_zerocopy_elements(), Some(("qtdemux", "h264parse")));
+
+        let hevc_mkv = VideoInfo {
+            codec_name: Some("hevc".into()),
+            pix_fmt: Some("yuv420p10le".into()),
+            format_name: Some("matroska,webm".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            hevc_mkv.gst_zerocopy_elements(),
+            Some(("matroskademux", "h265parse"))
+        );
     }
 
     #[test]

@@ -87,6 +87,11 @@ struct Args {
     /// Optional persistent skip-cache file to avoid re-probing unchanged skipped files
     #[arg(long)]
     state_file: Option<PathBuf>,
+
+    /// Force re-encoding without pre-skipping already HEVC/AV1/VP9 or low-BPP videos
+    /// (still strictly guarantees output is smaller than input)
+    #[arg(short = 'f', long = "force", alias = "reencode-hevc", default_value = "false")]
+    force: bool,
 }
 
 /// Default cap on image-processing concurrency (NFS I/O-bound sweet spot).
@@ -140,13 +145,14 @@ fn resolve_cpu_video_jobs(jobs_arg: usize, serial: bool) -> usize {
 
 fn build_cache_fingerprint(encoder_type: EncoderType, args: &Args) -> String {
     format!(
-        "v2|enc={}|xpsnr={:.1}|min={}|maxq={}|preset={}|audio={}",
+        "v2|enc={}|xpsnr={:.1}|min={}|maxq={}|preset={}|audio={}|force={}",
         encoder_type.short_id(),
         args.target_xpsnr,
         args.min_compression_ratio,
         args.max_crf,
         args.preset,
-        args.audio_bitrate
+        args.audio_bitrate,
+        args.force as u8
     )
 }
 
@@ -345,8 +351,11 @@ fn main() -> Result<()> {
     log_info("输出模式: 原子原地替换（视频->10-bit H.265 .mp4 / 图片->.webp，严格不大于原片）");
     log_info(&format!("编码器: {}", encoder_type.display_name()));
     log_info(&format!(
-        "感知目标: XPSNR >= {:.1} dB | 质量上限Q: {} | 最小净节省: {}%",
-        args.target_xpsnr, args.max_crf, args.min_compression_ratio
+        "感知目标: XPSNR >= {:.1} dB | 质量上限Q: {} | 最小净节省: {}%{}",
+        args.target_xpsnr,
+        args.max_crf,
+        args.min_compression_ratio,
+        if args.force { " | 强制不跳过(已HEVC/低BPP也重编码评估)" } else { "" }
     ));
     log_info(&format!(
         "编码预设: {} | 音频目标: {} (兼容低码率自动直拷)",
@@ -433,6 +442,7 @@ fn main() -> Result<()> {
                 max_crf: args.max_crf,
                 min_compression_ratio: args.min_compression_ratio,
                 audio_bitrate: args.audio_bitrate,
+                force: args.force,
                 max_concurrency: resolve_gpu_max_jobs(args.jobs),
                 state_cache,
             };
@@ -448,6 +458,7 @@ fn main() -> Result<()> {
                 max_crf: args.max_crf,
                 min_compression_ratio: args.min_compression_ratio,
                 audio_bitrate: args.audio_bitrate,
+                force: args.force,
                 max_concurrency: if encoder_type == EncoderType::JetsonNvmpi {
                     1
                 } else {
@@ -508,6 +519,7 @@ fn main() -> Result<()> {
             max_crf: args.max_crf,
             min_compression_ratio: args.min_compression_ratio,
             audio_bitrate: args.audio_bitrate,
+            force: args.force,
             max_concurrency: video_jobs,
             state_cache: state_cache.clone(),
         };

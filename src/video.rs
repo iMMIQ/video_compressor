@@ -352,6 +352,7 @@ pub fn process_video(
     max_crf: u8,
     min_saving_percent: u8,
     audio_bitrate: u32,
+    force: bool,
     gpu_index: Option<usize>,
     hw_slots: Option<&HwSlotPool>,
     state_cache: Option<&StateCache>,
@@ -375,7 +376,8 @@ pub fn process_video(
     let input_size = original_metadata.len();
     let mtime_secs = file_mtime_secs(&original_metadata);
 
-    if let Some(cache) = state_cache
+    if !force
+        && let Some(cache) = state_cache
         && let Some(reason) = cache.get_cached_skip(input_path, input_size, mtime_secs)
     {
         return Ok(ProcessResult::Skipped(format!("{} (缓存)", reason)));
@@ -409,14 +411,18 @@ pub fn process_video(
         if video_info.is_hdr() { " [HDR]" } else { "" }
     ));
 
-    // Skip already modern codecs (HEVC, AV1, VP9) permanently.
-    if let Some(reason) = video_info.is_modern_codec() {
-        return record_skip(reason.to_string(), true);
-    }
+    if !force {
+        // Skip already modern codecs (HEVC, AV1, VP9) permanently.
+        if let Some(reason) = video_info.is_modern_codec() {
+            return record_skip(reason.to_string(), true);
+        }
 
-    // Skip already heavily compressed H.264 sources (ultra-low BPP).
-    if let Some(reason) = should_skip_low_bpp(&video_info, input_size) {
-        return record_skip(reason, false);
+        // Skip already heavily compressed H.264 sources (ultra-low BPP).
+        if let Some(reason) = should_skip_low_bpp(&video_info, input_size) {
+            return record_skip(reason, false);
+        }
+    } else if let Some(reason) = video_info.is_modern_codec() {
+        log_info(&format!("  (--force 已启用: {}，仍强制进行感知重编码评估)", reason));
     }
 
     // Select active encoder backend; fall back to 10-bit CPU if unsupported

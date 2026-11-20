@@ -78,6 +78,7 @@ make musl
 | `--repair-webp` | 修复旧版 EXIF-first WebP 后退出 | `false` |
 | `--log-level` | 日志级别 (`quiet`/`info`/`debug`) | `info` |
 | `--state-file` | 带配置指纹的增量跳过缓存文件 | 无 |
+| `-f, --force` (`--reencode-hevc`) | 强制不预跳过已是 HEVC/AV1/VP9 或低 BPP 的视频（仍严格保证输出小于原片） | `false` |
 
 ## 许可
 
